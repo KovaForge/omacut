@@ -22,8 +22,9 @@ ApplicationWindow {
     property bool helpVisible: false
     property bool quitConfirmVisible: false
     property bool uploadVisible: false
-    // Either dialog quiets the playback and trim keys, so they reach it.
-    readonly property bool modalVisible: quitConfirmVisible || uploadVisible
+    readonly property bool hostsVisible: hostSettings.visible
+    // Any dialog quiets the playback and trim keys, so they reach it.
+    readonly property bool modalVisible: quitConfirmVisible || uploadVisible || hostsVisible
     // 0 uploads at the original size, otherwise a downscale height.
     property int uploadHeight: 0
     // Filled when the dialog opens, from the loaded video's size.
@@ -81,6 +82,10 @@ ApplicationWindow {
         pendingExportStartSec = trimBar.startSec;
         pendingExportEndSec = trimBar.endSec;
         backend.uploadClip(trimBar.startSec, trimBar.endSec, win.uploadHeight);
+    }
+    function showHosts() {
+        win.uploadVisible = false;
+        hostSettings.open();
     }
     function stepUploadDestination(delta) {
         var count = backend.uploadDestinations.length;
@@ -288,7 +293,7 @@ ApplicationWindow {
     Shortcut {
         sequence: "Ctrl+U"
         context: Qt.ApplicationShortcut
-        enabled: win.hasVideo && backend.duration > 0 && !backend.busy && !win.uploadVisible
+        enabled: win.hasVideo && backend.duration > 0 && !backend.busy && !win.modalVisible
         onActivated: showUpload()
     }
 
@@ -323,6 +328,8 @@ ApplicationWindow {
         onActivated: {
             if (win.quitConfirmVisible)
                 win.quitConfirmVisible = false;
+            else if (win.hostsVisible)
+                hostSettings.back();
             else if (win.uploadVisible)
                 win.uploadVisible = false;
             else if (win.helpVisible)
@@ -401,39 +408,6 @@ ApplicationWindow {
         interval: 5000
         repeat: false
         onTriggered: win.noticeText = ""
-    }
-
-    component DialogButton: Rectangle {
-        id: dialogButton
-        width: dialogButtonLabel.implicitWidth + 28
-        height: 34
-        radius: 8
-
-        property string text: ""
-        property bool primary: false
-        signal clicked()
-
-        color: primary ? win.accent : "#2c2c2f"
-        border.color: activeFocus ? (primary ? win.accentForeground : win.accent) : "transparent"
-        border.width: activeFocus ? 2 : 0
-
-        Keys.onReturnPressed: clicked()
-        Keys.onEnterPressed: clicked()
-        Keys.onSpacePressed: clicked()
-
-        Label {
-            id: dialogButtonLabel
-            anchors.centerIn: parent
-            text: dialogButton.text
-            color: dialogButton.primary ? win.accentForeground : "white"
-            font.pixelSize: 13
-            font.weight: Font.DemiBold
-        }
-        MouseArea {
-            anchors.fill: parent
-            cursorShape: Qt.PointingHandCursor
-            onClicked: dialogButton.clicked()
-        }
     }
 
     component IconButton: Rectangle {
@@ -977,20 +951,19 @@ ApplicationWindow {
                     }
                 }
 
-                Label {
-                    width: parent.width
-                    topPadding: 6
-                    text: "Add hosts as ShareX .sxcu files in " + backend.uploadDestinationsDir
-                    color: "#7a7a80"
-                    font.pixelSize: 11
-                    wrapMode: Text.WrapAnywhere
-                    bottomPadding: 12
+                Item {
+                    width: 1
+                    height: 12
                 }
 
                 Row {
                     anchors.right: parent.right
                     spacing: 10
 
+                    DialogButton {
+                        text: "Hosts…"
+                        onClicked: showHosts()
+                    }
                     DialogButton {
                         text: "Cancel"
                         onClicked: win.uploadVisible = false
@@ -1002,6 +975,21 @@ ApplicationWindow {
                     }
                 }
             }
+        }
+    }
+
+    // --- upload hosts ---
+    HostSettings {
+        id: hostSettings
+        objectName: "hostSettings"
+        anchors.fill: parent
+        visible: false
+        hosts: backend.hosts
+        uploadersDir: backend.uploadDestinationsDir
+        // Back to the upload dialog, with any new hosts in it.
+        onClosed: {
+            if (win.hasVideo && backend.duration > 0 && !backend.busy)
+                showUpload();
         }
     }
 

@@ -22,6 +22,7 @@
 #include "thumbprovider.h"
 #include "thumbworker.h"
 #include "upload/hosts.h"
+#include "upload/secretstore.h"
 
 class FakeFilePicker : public FilePicker {
     Q_OBJECT
@@ -79,10 +80,21 @@ class ShortcutBackend : public QObject {
     Q_PROPERTY(int uploadDestination MEMBER uploadDestination NOTIFY uploadDestinationChanged)
     Q_PROPERTY(QString uploadDestinationsDir READ uploadDestinationsDir CONSTANT)
     Q_PROPERTY(bool uploading READ uploading CONSTANT)
+    Q_PROPERTY(QObject *hosts READ hostsObject CONSTANT)
 
 public:
+    // The hosts are real, kept in a temporary folder with in-memory secrets.
     explicit ShortcutBackend(QUrl source, double duration, QObject *parent = nullptr)
-        : QObject(parent), m_source(std::move(source)), m_duration(duration) {}
+        : QObject(parent), m_source(std::move(source)), m_duration(duration),
+          m_hostsDir(std::make_unique<QTemporaryDir>()) {
+        auto store = std::make_unique<upload::MemorySecretStore>();
+        secrets = store.get();
+        hosts = new upload::Hosts(m_hostsDir->path(), std::move(store), this);
+    }
+
+    QObject *hostsObject() const { return hosts; }
+    upload::Hosts *hosts = nullptr;
+    upload::MemorySecretStore *secrets = nullptr;
 
     QUrl source() const { return m_source; }
     double duration() const { return m_duration; }
@@ -159,12 +171,22 @@ signals:
 private:
     QUrl m_source;
     double m_duration;
+    std::unique_ptr<QTemporaryDir> m_hostsDir;
 };
+
+// Every item in the window's visual tree. Unlike findChildren, this reaches
+// items a Repeater made, which have no QObject parent.
+static QList<QQuickItem *> visualItems(QQuickItem *root) {
+    QList<QQuickItem *> items{root};
+    for (QQuickItem *child : root->childItems())
+        items += visualItems(child);
+    return items;
+}
 
 // Finds a shown DialogButton by its label ("primary" tells them apart from
 // Labels, and several dialogs share labels like "Cancel").
 static QQuickItem *dialogButton(QQuickWindow *window, const QString &text) {
-    const auto items = window->findChildren<QQuickItem *>();
+    const auto items = visualItems(window->contentItem());
     for (QQuickItem *item : items) {
         if (item->isVisible() && item->property("primary").isValid()
                 && item->property("text").toString() == text)
@@ -231,6 +253,7 @@ private slots:
     void qmlZoomFocusesTheSelection();
     void qmlQuitConfirmsUnexportedTrim();
     void qmlUploadDialogPicksHostAndQuality();
+    void qmlHostSettingsAddEditAndRemoveHosts();
     void trimArgsReencodeForPreciseCuts();
     void trimArgsScaleTheShorterSide();
     void exportHeightsNeverUpscale();
@@ -974,6 +997,119 @@ void BackendTests::qmlUploadDialogPicksHostAndQuality() {
     QTRY_COMPARE_WITH_TIMEOUT(window->property("trimDirty").toBool(), true, 3000);
     backend.announceUploadDone();
     QTRY_COMPARE_WITH_TIMEOUT(window->property("trimDirty").toBool(), false, 3000);
+}
+
+// Clicks a DialogButton even when it's scrolled out of view.
+static void press(QQuickItem *button) {
+    QVERIFY(button);
+    QVERIFY(QMetaObject::invokeMethod(button, "clicked"));
+}
+
+static QQuickItem *namedItem(QQuickWindow *window, const QString &name) {
+    const auto items = visualItems(window->contentItem());
+    for (QQuickItem *item : items) {
+        if (item->isVisible() && item->objectName() == name)
+            return item;
+    }
+    return nullptr;
+}
+
+void BackendTests::qmlHostSettingsAddEditAndRemoveHosts() {
+    ShortcutBackend backend(QUrl::fromLocalFile(m_dir.filePath(QStringLiteral("shortcut-placeholder.mp4"))),
+                            20.0);
+    QmlHarness harness(backend);
+    QVERIFY2(harness.window(), qPrintable(mainQmlPath()));
+    QQuickWindow *window = harness.window();
+    QTRY_VERIFY_WITH_TIMEOUT(window->property("audioOutputReady").toBool(), 3000);
+    backend.announceInfo();
+    window->show();
+    window->requestActivate();
+    QTest::qWait(100);
+    QObject *panel = window->findChild<QObject *>(QStringLiteral("hostSettings"));
+    QVERIFY(panel);
+
+    // From the upload dialog to the host list.
+    QTest::keyClick(window, Qt::Key_U, Qt::ControlModifier);
+    QTRY_COMPARE_WITH_TIMEOUT(window->property("uploadVisible").toBool(), true, 3000);
+    press(dialogButton(window, QStringLiteral("Hosts…")));
+    QTRY_COMPARE_WITH_TIMEOUT(window->property("hostsVisible").toBool(), true, 3000);
+    QCOMPARE(window->property("uploadVisible").toBool(), false);
+    QCOMPARE(panel->property("mode").toString(), QStringLiteral("list"));
+
+    // Add an S3 host by typing into the generated form. Keys that are
+    // shortcuts elsewhere (q quits, ? shows help) are just text here.
+    press(dialogButton(window, QStringLiteral("Add host")));
+    QTRY_COMPARE(panel->property("mode").toString(), QStringLiteral("pick"));
+    QQuickItem *s3 = namedItem(window, QStringLiteral("provider_s3"));
+    QVERIFY(s3);
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, itemCenter(s3));
+    QTRY_COMPARE(panel->property("mode").toString(), QStringLiteral("edit"));
+
+    // Types into a field, replacing what's there unless appending.
+    const auto type = [window](const QString &field, const QString &text, bool append = false) {
+        QQuickItem *input = namedItem(window, QStringLiteral("field_") + field);
+        QVERIFY2(input, qPrintable(field));
+        input->forceActiveFocus();
+        if (!append)
+            QMetaObject::invokeMethod(input, "selectAll");
+        for (const QChar c : text)
+            QTest::keyClick(window, c.toLatin1());
+    };
+    // New hosts start out named after their kind; saving too early explains
+    // what's missing.
+    QCOMPARE(namedItem(window, QStringLiteral("field_name"))->property("text").toString(),
+             QStringLiteral("Amazon S3 or compatible"));
+    press(dialogButton(window, QStringLiteral("Save")));
+    QTRY_COMPARE(panel->property("formError").toString(), QStringLiteral("Bucket is required."));
+
+    type(QStringLiteral("name"), QStringLiteral("quick? clips"));
+    type(QStringLiteral("bucket"), QStringLiteral("clips"));
+    press(dialogButton(window, QStringLiteral("Save")));
+    QTRY_COMPARE(panel->property("formError").toString(), QStringLiteral("Access key ID is required."));
+    type(QStringLiteral("accessKeyId"), QStringLiteral("AKID"));
+    type(QStringLiteral("secretAccessKey"), QStringLiteral("s3cret"));
+    QCOMPARE(window->property("quitConfirmVisible").toBool(), false);
+    QCOMPARE(window->property("helpVisible").toBool(), false);
+    press(dialogButton(window, QStringLiteral("Save")));
+    QTRY_COMPARE(panel->property("mode").toString(), QStringLiteral("list"));
+
+    const upload::Host &saved = backend.hosts->all().last();
+    QCOMPARE(saved.name, QStringLiteral("quick? clips"));
+    QCOMPARE(saved.provider, QStringLiteral("s3"));
+    QCOMPARE(saved.settings.value(QStringLiteral("bucket")).toString(), QStringLiteral("clips"));
+    QCOMPARE(saved.settings.value(QStringLiteral("region")).toString(), QStringLiteral("us-east-1"));
+    QCOMPARE(backend.secrets->read(saved.id + QStringLiteral("/secretAccessKey")), QStringLiteral("s3cret"));
+
+    // Editing shows the stored values; the secret stays hidden and kept.
+    const QString id = saved.id;
+    press(dialogButton(window, QStringLiteral("Edit")));
+    QTRY_COMPARE(panel->property("mode").toString(), QStringLiteral("edit"));
+    QQuickItem *bucket = namedItem(window, QStringLiteral("field_bucket"));
+    QCOMPARE(bucket->property("text").toString(), QStringLiteral("clips"));
+    QQuickItem *secret = namedItem(window, QStringLiteral("field_secretAccessKey"));
+    QCOMPARE(secret->property("text").toString(), QString());
+    QCOMPARE(secret->property("placeholderText").toString(), QStringLiteral("Stored — leave blank to keep it"));
+    type(QStringLiteral("bucket"), QStringLiteral("-2"), true);
+    press(dialogButton(window, QStringLiteral("Save")));
+    QTRY_COMPARE(panel->property("mode").toString(), QStringLiteral("list"));
+    QCOMPARE(backend.hosts->find(id)->settings.value(QStringLiteral("bucket")).toString(),
+             QStringLiteral("clips-2"));
+    QCOMPARE(backend.secrets->read(id + QStringLiteral("/secretAccessKey")), QStringLiteral("s3cret"));
+
+    // Remove asks twice.
+    press(dialogButton(window, QStringLiteral("Remove")));
+    QVERIFY(backend.hosts->find(id));
+    press(dialogButton(window, QStringLiteral("Really remove")));
+    QTRY_VERIFY(!backend.hosts->find(id));
+
+    // Escape steps back out: form to list, list to the upload dialog.
+    press(dialogButton(window, QStringLiteral("Add host")));
+    QTRY_COMPARE(panel->property("mode").toString(), QStringLiteral("pick"));
+    QTest::keyClick(window, Qt::Key_Escape);
+    QTRY_COMPARE(panel->property("mode").toString(), QStringLiteral("list"));
+    QTest::keyClick(window, Qt::Key_Escape);
+    QTRY_COMPARE_WITH_TIMEOUT(window->property("hostsVisible").toBool(), false, 3000);
+    QTRY_COMPARE_WITH_TIMEOUT(window->property("uploadVisible").toBool(), true, 3000);
 }
 
 void BackendTests::trimArgsReencodeForPreciseCuts() {
