@@ -12,12 +12,16 @@
 #include <QQuickWindow>
 #include <QSignalSpy>
 #include <QStandardPaths>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QTemporaryDir>
 
 #include "backend.h"
+#include "fakehttpserver.h"
 #include "filepicker.h"
 #include "thumbprovider.h"
 #include "thumbworker.h"
+#include "uploader.h"
 
 class FakeFilePicker : public FilePicker {
     Q_OBJECT
@@ -199,12 +203,22 @@ private slots:
     void exportHeightsNeverUpscale();
     void themeAccentReadsOmarchyColors();
     void themeAccentForegroundKeepsContrast();
+    void uploadDestinationsIncludeBuiltInsAndUserFiles();
+    void uploadDestinationIsRemembered();
+    void uploadClipEncodesUploadsAndCopiesTheLink();
+    void uploadFailureClearsBusyWithoutHistory();
+    void uploadZeroLengthClipFails();
+    void uploadCanBeCancelled();
 
 private:
     QUrl videoUrl() const { return QUrl::fromLocalFile(m_videoPath); }
     QString formatName(const QString &path) const;
     void waitForBackgroundWork(Backend &backend);
     bool installBrokenFfmpeg(const QString &dirPath);
+    // Installs a user .sxcu pointing at server and returns its index once the
+    // backend has picked it up.
+    int useFakeDestination(Backend &backend, const FakeHttpServer &server);
+    QStringList uploadHistory() const;
 
     QTemporaryDir m_dir;
     QString m_videoPath;
@@ -212,6 +226,14 @@ private:
 
 void BackendTests::initTestCase() {
     QQuickStyle::setStyle(QStringLiteral("Material"));
+
+    // Keep settings, user uploaders and the upload history out of the real
+    // ~/.config and ~/.local/state.
+    QStandardPaths::setTestModeEnabled(true);
+    QDir(uploads::userDestinationsDir()).removeRecursively();
+    QFile::remove(Backend::uploadHistoryPath());
+    QFile::remove(QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation)
+                  + QStringLiteral("/omacut/omacut.conf"));
 
     QVERIFY2(m_dir.isValid(), "temporary directory is valid");
     m_videoPath = m_dir.filePath(QStringLiteral("clip.mp4"));
@@ -930,6 +952,193 @@ void BackendTests::themeAccentForegroundKeepsContrast() {
     QCOMPARE(Backend::foregroundFor(QStringLiteral("#FFD60A")), QStringLiteral("black"));
     QCOMPARE(Backend::foregroundFor(QStringLiteral("#222266")), QStringLiteral("white"));
     QCOMPARE(Backend::foregroundFor(QStringLiteral("garbage")), QStringLiteral("black"));
+}
+
+int BackendTests::useFakeDestination(Backend &backend, const FakeHttpServer &server) {
+    const QString dir = uploads::userDestinationsDir();
+    QDir().mkpath(dir);
+    QFile file(QDir(dir).filePath(QStringLiteral("local.sxcu")));
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        return -1;
+    file.write(QStringLiteral(R"({"Name": "Local test", "RequestURL": "%1",
+                                  "FileFormName": "file", "URL": "{json:link}",
+                                  "DeletionURL": "{json:delete}"})")
+                   .arg(server.url())
+                   .toUtf8());
+    file.close();
+    backend.reloadUploadDestinations();
+    const int index = backend.uploadDestinations().indexOf(QStringLiteral("Local test"));
+    backend.setUploadDestination(index);
+    return index;
+}
+
+QStringList BackendTests::uploadHistory() const {
+    QFile file(Backend::uploadHistoryPath());
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
+        return {};
+    return QString::fromUtf8(file.readAll()).split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+}
+
+void BackendTests::uploadDestinationsIncludeBuiltInsAndUserFiles() {
+    ThumbProvider provider;
+    Backend backend(&provider, new FakeFilePicker);
+    FakeHttpServer server;
+    QVERIFY(server.listen());
+
+    const QStringList builtIns = backend.uploadDestinations();
+    QVERIFY(builtIns.contains(QStringLiteral("Catbox")));
+
+    QSignalSpy changed(&backend, &Backend::uploadDestinationsChanged);
+    const int index = useFakeDestination(backend, server);
+    QCOMPARE(index, builtIns.size());
+    QVERIFY(changed.count() >= 1);
+    QVERIFY(backend.uploadDestinationsDir().endsWith(QStringLiteral("/omacut/uploaders")));
+    QDir(uploads::userDestinationsDir()).removeRecursively();
+}
+
+void BackendTests::uploadDestinationIsRemembered() {
+    ThumbProvider provider;
+    {
+        Backend backend(&provider, new FakeFilePicker);
+        QCOMPARE(backend.uploadDestination(), 0);
+        backend.setUploadDestination(2);
+        QCOMPARE(backend.uploadDestination(), 2);
+        // Out-of-range picks are ignored.
+        backend.setUploadDestination(99);
+        QCOMPARE(backend.uploadDestination(), 2);
+    }
+    Backend reopened(&provider, new FakeFilePicker);
+    QCOMPARE(reopened.uploadDestination(), 2);
+    reopened.setUploadDestination(0);
+}
+
+void BackendTests::uploadClipEncodesUploadsAndCopiesTheLink() {
+    FakeHttpServer server;
+    QVERIFY(server.listen());
+    server.reply = R"({"link": "https://h.example/clip.mp4", "delete": "https://h.example/del/1"})";
+
+    ThumbProvider provider;
+    Backend backend(&provider, new FakeFilePicker);
+    QStringList copied;
+    backend.setLinkCopier([&copied](const QString &url) { copied << url; });
+    QVERIFY(useFakeDestination(backend, server) >= 0);
+    QSignalSpy doneSpy(&backend, &Backend::uploadDone);
+    QSignalSpy failedSpy(&backend, &Backend::uploadFailed);
+    QStringList statuses;
+    connect(&backend, &Backend::statusChanged, [&backend, &statuses] {
+        statuses << backend.status();
+    });
+
+    QVERIFY(backend.load(videoUrl()));
+    waitForBackgroundWork(backend);
+    const int historyBefore = uploadHistory().size();
+
+    backend.uploadClip(0.0, 1.0);
+    QVERIFY(backend.busy());
+    QVERIFY(backend.uploading());
+    QTRY_VERIFY_WITH_TIMEOUT(doneSpy.count() + failedSpy.count() > 0, 20000);
+    QVERIFY2(failedSpy.isEmpty(), qPrintable(failedSpy.value(0).value(0).toString()));
+
+    QCOMPARE(doneSpy.first().at(0).toString(), QStringLiteral("https://h.example/clip.mp4"));
+    QCOMPARE(doneSpy.first().at(1).toString(), QStringLiteral("https://h.example/del/1"));
+    QCOMPARE(copied, QStringList{QStringLiteral("https://h.example/clip.mp4")});
+    QVERIFY(!backend.busy());
+    QVERIFY(!backend.uploading());
+    QVERIFY(backend.status().isEmpty());
+    QVERIFY2(statuses.contains(QStringLiteral("Encoding 100%")),
+             qPrintable(statuses.join(QStringLiteral(" | "))));
+    QVERIFY(statuses.contains(QStringLiteral("Uploading 0%")));
+
+    // The host got a real mp4 under the name an export would have used.
+    QCOMPARE(server.requests.size(), 1);
+    const QByteArray body = server.requests.first().body;
+    QVERIFY(body.contains("filename=\"clip_trimmed.mp4\""));
+    QVERIFY(body.contains("ftyp"));
+
+    const QStringList history = uploadHistory();
+    QCOMPARE(history.size(), historyBefore + 1);
+    const QJsonObject entry = QJsonDocument::fromJson(history.last().toUtf8()).object();
+    QCOMPARE(entry.value(QStringLiteral("url")).toString(), QStringLiteral("https://h.example/clip.mp4"));
+    QCOMPARE(entry.value(QStringLiteral("deletion")).toString(), QStringLiteral("https://h.example/del/1"));
+    QCOMPARE(entry.value(QStringLiteral("destination")).toString(), QStringLiteral("Local test"));
+    QCOMPARE(entry.value(QStringLiteral("source")).toString(), m_videoPath);
+
+    QDir(uploads::userDestinationsDir()).removeRecursively();
+}
+
+void BackendTests::uploadFailureClearsBusyWithoutHistory() {
+    FakeHttpServer server;
+    QVERIFY(server.listen());
+    server.status = 500;
+    server.reply = "boom";
+
+    ThumbProvider provider;
+    Backend backend(&provider, new FakeFilePicker);
+    QStringList copied;
+    backend.setLinkCopier([&copied](const QString &url) { copied << url; });
+    QVERIFY(useFakeDestination(backend, server) >= 0);
+    QSignalSpy failedSpy(&backend, &Backend::uploadFailed);
+
+    QVERIFY(backend.load(videoUrl()));
+    waitForBackgroundWork(backend);
+    const int historyBefore = uploadHistory().size();
+
+    backend.uploadClip(0.0, 1.0);
+    QTRY_COMPARE_WITH_TIMEOUT(failedSpy.count(), 1, 20000);
+    QCOMPARE(failedSpy.first().at(0).toString(), QStringLiteral("Local test answered HTTP 500: boom"));
+    QVERIFY(!backend.busy());
+    QVERIFY(!backend.uploading());
+    QVERIFY(copied.isEmpty());
+    QCOMPARE(uploadHistory().size(), historyBefore);
+
+    QDir(uploads::userDestinationsDir()).removeRecursively();
+}
+
+void BackendTests::uploadZeroLengthClipFails() {
+    ThumbProvider provider;
+    Backend backend(&provider, new FakeFilePicker);
+    QSignalSpy failedSpy(&backend, &Backend::uploadFailed);
+    QVERIFY(backend.load(videoUrl()));
+    waitForBackgroundWork(backend);
+
+    backend.uploadClip(0.5, 0.5);
+    QCOMPARE(failedSpy.count(), 1);
+    QVERIFY(!backend.busy());
+    QVERIFY(!backend.uploading());
+}
+
+void BackendTests::uploadCanBeCancelled() {
+    // Accepts the connection but never answers, so the upload stays open.
+    QTcpServer silent;
+    QVERIFY(silent.listen(QHostAddress::LocalHost));
+    FakeHttpServer unused;
+    QVERIFY(unused.listen());
+
+    ThumbProvider provider;
+    Backend backend(&provider, new FakeFilePicker);
+    QVERIFY(useFakeDestination(backend, unused) >= 0);
+    QFile sxcuFile(QDir(uploads::userDestinationsDir()).filePath(QStringLiteral("local.sxcu")));
+    QVERIFY(sxcuFile.open(QIODevice::WriteOnly | QIODevice::Truncate));
+    sxcuFile.write(QStringLiteral(R"({"Name": "Local test", "RequestURL": "http://127.0.0.1:%1/",
+                                      "FileFormName": "file"})")
+                       .arg(silent.serverPort())
+                       .toUtf8());
+    sxcuFile.close();
+    backend.reloadUploadDestinations();
+    QSignalSpy failedSpy(&backend, &Backend::uploadFailed);
+
+    QVERIFY(backend.load(videoUrl()));
+    waitForBackgroundWork(backend);
+
+    backend.uploadClip(0.0, 1.0);
+    QTRY_VERIFY_WITH_TIMEOUT(silent.hasPendingConnections(), 20000);
+    backend.cancelUpload();
+    QTRY_COMPARE_WITH_TIMEOUT(failedSpy.count(), 1, 5000);
+    QCOMPARE(failedSpy.first().at(0).toString(), QStringLiteral("Upload cancelled."));
+    QVERIFY(!backend.busy());
+    QVERIFY(!backend.uploading());
+
+    QDir(uploads::userDestinationsDir()).removeRecursively();
 }
 
 QTEST_MAIN(BackendTests)

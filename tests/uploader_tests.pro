@@ -6,6 +6,7 @@ TEMPLATE = app
 INCLUDEPATH += ../src
 
 HEADERS += \
+    fakehttpserver.h \
     ../src/sxcu.h \
     ../src/uploader.h
 

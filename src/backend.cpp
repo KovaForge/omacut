@@ -1,10 +1,18 @@
 #include "backend.h"
 
+#include <QClipboard>
 #include <QColor>
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QGuiApplication>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QProcess>
+#include <QSettings>
+#include <QStandardPaths>
+#include <QTemporaryDir>
 #include <QTextStream>
 
 #include <cstdio>
@@ -14,11 +22,15 @@
 #include "portalfilepicker.h"
 #include "thumbprovider.h"
 #include "thumbworker.h"
+#include "uploader.h"
 
 namespace {
 constexpr int kThumbCount = 12;
 constexpr int kThumbRevealMs = 70;
 const QString kDefaultAccent = QStringLiteral("#FFD60A");
+const QString kUploadDestinationKey = QStringLiteral("upload/destination");
+// Settings live in ~/.config/omacut/omacut.conf, beside the user's uploaders.
+const QString kSettingsName = QStringLiteral("omacut");
 
 QString omarchyCurrentDir() {
     return QDir::homePath() + QStringLiteral("/.local/state/omarchy/current");
@@ -55,6 +67,9 @@ Backend::Backend(ThumbProvider *provider, FilePicker *filePicker, QObject *paren
     if (!m_filePicker->parent())
         m_filePicker->setParent(this);
     wireFilePicker();
+    wireUploader();
+    m_copyLink = &Backend::copyToClipboard;
+    reloadUploadDestinations();
     m_thumbRevealTimer.setInterval(kThumbRevealMs);
     connect(&m_thumbRevealTimer, &QTimer::timeout, this, &Backend::revealNextThumb);
 
@@ -78,6 +93,26 @@ void Backend::wireFilePicker() {
     connect(m_filePicker, &FilePicker::openSelected, this, &Backend::load);
     connect(m_filePicker, &FilePicker::exportSelected, this, &Backend::exportClip);
     connect(m_filePicker, &FilePicker::failed, this, &Backend::loadError);
+}
+
+void Backend::wireUploader() {
+    m_uploader = new Uploader(this);
+    connect(m_uploader, &Uploader::progress, this, [this](qint64 sent, qint64 total) {
+        if (total > 0)
+            setStatus(QStringLiteral("Uploading %1%").arg(qBound(0, int(sent * 100 / total), 100)));
+    });
+    connect(m_uploader, &Uploader::finished, this,
+            [this](const QString &url, const QString &thumbnailUrl, const QString &deletionUrl) {
+                if (m_copyLink)
+                    m_copyLink(url);
+                appendUploadHistory(url, thumbnailUrl, deletionUrl);
+                finishUpload();
+                emit uploadDone(url, deletionUrl);
+            });
+    connect(m_uploader, &Uploader::failed, this, [this](const QString &message) {
+        finishUpload();
+        emit uploadFailed(message);
+    });
 }
 
 void Backend::setBusy(bool busy) {
@@ -334,14 +369,27 @@ void Backend::exportClip(const QUrl &dst, double start, double end, int scaleHei
         return;
     }
 
+    encodeClip(outPath, start, end, scaleHeight, QStringLiteral("Exporting"),
+               [this, outPath](const QString &error) {
+                   setBusy(false);
+                   setStatus(QString());
+                   if (error.isEmpty())
+                       emit exportDone(outPath);
+                   else
+                       emit exportFailed(error);
+               });
+}
+
+void Backend::encodeClip(const QString &outPath, double start, double end, int scaleHeight,
+                         const QString &verb, std::function<void(const QString &)> done) {
     const QString ffmpegBin = ffmpeg::toolPath("ffmpeg");
     if (ffmpegBin.isEmpty()) {
-        emit exportFailed("`ffmpeg` was not found on your PATH.");
+        done(QStringLiteral("`ffmpeg` was not found on your PATH."));
         return;
     }
 
     setBusy(true);
-    setStatus(QStringLiteral("Exporting 0%"));
+    setStatus(QStringLiteral("%1 0%").arg(verb));
 
     // Encode to a sibling temp file and atomically replace the target only after
     // success, so failed/cancelled exports preserve any existing file.
@@ -350,14 +398,22 @@ void Backend::exportClip(const QUrl &dst, double start, double end, int scaleHei
     const QStringList args = ffmpeg::trimArgs(m_path, tmpPath, start, end, scaleHeight);
 
     auto *proc = new QProcess(this);
+    m_encoder = proc;
     auto completed = std::make_shared<bool>(false);
+    const auto finish = [proc, tmpPath, completed, done](const QString &error) {
+        *completed = true;
+        proc->deleteLater();
+        if (!error.isEmpty())
+            QFile::remove(tmpPath);
+        done(error);
+    };
 
     // ffmpeg -progress writes key=value blocks to stdout as it encodes;
     // out_time_us against the clip length gives the percentage.
     const double clipLen = end - start;
     auto progressBuf = std::make_shared<QByteArray>();
     connect(proc, &QProcess::readyReadStandardOutput, this,
-            [this, proc, progressBuf, clipLen, completed] {
+            [this, proc, progressBuf, clipLen, completed, verb] {
                 progressBuf->append(proc->readAllStandardOutput());
                 int newline;
                 while ((newline = progressBuf->indexOf('\n')) >= 0) {
@@ -370,44 +426,176 @@ void Backend::exportClip(const QUrl &dst, double start, double end, int scaleHei
                     if (!ok)
                         continue;
                     const int percent = qBound(0, qRound(outSecs / clipLen * 100.0), 100);
-                    setStatus(QStringLiteral("Exporting %1%").arg(percent));
+                    setStatus(QStringLiteral("%1 %2%").arg(verb).arg(percent));
                 }
             });
 
     connect(proc, &QProcess::finished, this,
-            [this, proc, outPath, tmpPath, completed](int code, QProcess::ExitStatus exitStatus) {
+            [proc, outPath, tmpPath, completed, finish](int code, QProcess::ExitStatus exitStatus) {
                 if (*completed)
                     return;
-                *completed = true;
                 const QString err = QString::fromUtf8(proc->readAllStandardError()).trimmed();
-                proc->deleteLater();
                 if (exitStatus != QProcess::NormalExit || code != 0) {
-                    failExport(tmpPath, err.isEmpty() ? QStringLiteral("ffmpeg trim failed.") : err);
+                    finish(err.isEmpty() ? QStringLiteral("ffmpeg trim failed.") : err);
                     return;
                 }
                 if (!replaceWithTemp(tmpPath, outPath)) {
-                    failExport(tmpPath, QStringLiteral("Could not write the exported file."));
+                    finish(QStringLiteral("Could not write the exported file."));
                     return;
                 }
-                setBusy(false);
-                setStatus(QString());
-                emit exportDone(outPath);
+                finish(QString());
             });
     connect(proc, &QProcess::errorOccurred, this,
-            [this, proc, tmpPath, completed](QProcess::ProcessError error) {
+            [proc, completed, finish](QProcess::ProcessError error) {
                 if (error != QProcess::FailedToStart || *completed)
                     return;
-                *completed = true;
                 const QString err = proc->errorString();
-                proc->deleteLater();
-                failExport(tmpPath, err.isEmpty() ? QStringLiteral("Could not start ffmpeg.") : err);
+                finish(err.isEmpty() ? QStringLiteral("Could not start ffmpeg.") : err);
             });
     proc->start(ffmpegBin, args);
 }
 
-void Backend::failExport(const QString &tmpPath, const QString &message) {
+QString Backend::uploadDestinationsDir() const {
+    return uploads::userDestinationsDir();
+}
+
+QString Backend::uploadHistoryPath() {
+    return QStandardPaths::writableLocation(QStandardPaths::GenericStateLocation)
+        + QStringLiteral("/omacut/uploads.jsonl");
+}
+
+void Backend::reloadUploadDestinations() {
+    QStringList warnings;
+    m_uploadDestinations = uploads::builtInDestinations()
+        + uploads::loadDestinations(uploads::userDestinationsDir(), &warnings);
+    for (const QString &warning : warnings)
+        qWarning("omacut: skipping uploader %s", qPrintable(warning));
+
+    QStringList names;
+    for (const sxcu::Destination &destination : m_uploadDestinations)
+        names << destination.name;
+
+    // The choice is remembered by name, so it survives uploaders being added
+    // or removed around it.
+    const QSettings settings(QSettings::UserScope, kSettingsName, kSettingsName);
+    const QString saved = settings.value(kUploadDestinationKey).toString();
+    const int index = qMax(0, names.indexOf(saved));
+    if (names != m_uploadDestinationNames || index != m_uploadDestination) {
+        m_uploadDestinationNames = names;
+        m_uploadDestination = index;
+        emit uploadDestinationsChanged();
+    }
+}
+
+void Backend::setUploadDestination(int index) {
+    if (index < 0 || index >= m_uploadDestinations.size() || index == m_uploadDestination)
+        return;
+    m_uploadDestination = index;
+    QSettings settings(QSettings::UserScope, kSettingsName, kSettingsName);
+    settings.setValue(kUploadDestinationKey, m_uploadDestinations.at(index).name);
+    emit uploadDestinationsChanged();
+}
+
+QList<int> Backend::uploadHeights() const {
+    return m_info.ok ? exportHeights(m_info.width, m_info.height) : QList<int>();
+}
+
+void Backend::uploadClip(double start, double end, int scaleHeight) {
+    if (m_path.isEmpty() || !m_info.ok || m_busy)
+        return;
+
+    if (end - start <= 0.0) {
+        emit uploadFailed(QStringLiteral("The selected clip has no length."));
+        return;
+    }
+    if (m_uploadDestination < 0 || m_uploadDestination >= m_uploadDestinations.size()) {
+        emit uploadFailed(QStringLiteral("No upload destination is set up."));
+        return;
+    }
+
+    // The trim is encoded into a private temp dir under the same name an
+    // export would suggest, since hosts show that name to whoever opens it.
+    m_uploadDir = std::make_unique<QTemporaryDir>(QDir::tempPath()
+                                                  + QStringLiteral("/omacut-upload-XXXXXX"));
+    if (!m_uploadDir->isValid()) {
+        m_uploadDir.reset();
+        emit uploadFailed(QStringLiteral("Could not create a temporary file for the upload."));
+        return;
+    }
+    const QString clipPath = m_uploadDir->filePath(suggestedExportUrl().fileName());
+    const sxcu::Destination destination = m_uploadDestinations.at(m_uploadDestination);
+    m_uploading = true;
+    m_uploadCancelled = false;
+    m_uploadStart = start;
+    m_uploadEnd = end;
+    emit uploadingChanged();
+
+    encodeClip(clipPath, start, end, scaleHeight, QStringLiteral("Encoding"),
+               [this, clipPath, destination](const QString &error) {
+                   if (m_uploadCancelled || !error.isEmpty()) {
+                       finishUpload();
+                       emit uploadFailed(m_uploadCancelled ? QStringLiteral("Upload cancelled.")
+                                                           : error);
+                       return;
+                   }
+                   m_uploadDestinationName = destination.name;
+                   setStatus(QStringLiteral("Uploading 0%"));
+                   m_uploader->upload(destination, clipPath);
+               });
+}
+
+void Backend::cancelUpload() {
+    if (!m_uploading)
+        return;
+    m_uploadCancelled = true;
+    if (m_uploader->busy())
+        m_uploader->cancel();
+    else if (m_encoder)
+        m_encoder->kill();
+}
+
+void Backend::finishUpload() {
+    m_uploadDir.reset();
     setBusy(false);
     setStatus(QString());
-    QFile::remove(tmpPath);
-    emit exportFailed(message);
+    if (m_uploading) {
+        m_uploading = false;
+        emit uploadingChanged();
+    }
+}
+
+void Backend::appendUploadHistory(const QString &url, const QString &thumbnailUrl,
+                                  const QString &deletionUrl) const {
+    // One JSON object per line, so a deletion link is never lost to the
+    // clipboard being overwritten.
+    QJsonObject entry{
+        {QStringLiteral("time"), QDateTime::currentDateTime().toString(Qt::ISODate)},
+        {QStringLiteral("destination"), m_uploadDestinationName},
+        {QStringLiteral("source"), m_path},
+        {QStringLiteral("start"), m_uploadStart},
+        {QStringLiteral("end"), m_uploadEnd},
+        {QStringLiteral("url"), url},
+    };
+    if (!thumbnailUrl.isEmpty())
+        entry.insert(QStringLiteral("thumbnail"), thumbnailUrl);
+    if (!deletionUrl.isEmpty())
+        entry.insert(QStringLiteral("deletion"), deletionUrl);
+
+    const QString path = uploadHistoryPath();
+    QDir().mkpath(QFileInfo(path).path());
+    QFile file(path);
+    if (file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
+        file.write(QJsonDocument(entry).toJson(QJsonDocument::Compact) + '\n');
+}
+
+void Backend::copyToClipboard(const QString &text) {
+    // A Wayland selection dies with the app that owns it, and omacut is often
+    // closed right after sharing; wl-copy keeps serving it in the background.
+    if (qEnvironmentVariableIsSet("WAYLAND_DISPLAY")) {
+        const QString wlCopy = QStandardPaths::findExecutable(QStringLiteral("wl-copy"));
+        if (!wlCopy.isEmpty() && QProcess::startDetached(wlCopy, {QStringLiteral("--"), text}))
+            return;
+    }
+    if (QClipboard *clipboard = QGuiApplication::clipboard())
+        clipboard->setText(text);
 }
