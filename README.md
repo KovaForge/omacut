@@ -2,6 +2,8 @@
 
 A dead-simple video **length** trimmer. Open a video, drag the two handles to pick a start and end, preview the clip, and export. On Omarchy, the interface follows your theme's accent color.
 
+> **KovaForge fork:** [`dotnet/`](dotnet/README.md) contains a native C#/Avalonia port with crop, MP4/WebM/GIF export and an embedding API. [XerahS](https://github.com/KovaForge/XerahS) uses it as its video editor. The Qt app below is unchanged from upstream.
+
 Built using **Qt Quick (QML)** UI with the Material style — the same Qt stack Quickshell builds on — and **ffmpeg** for the cut. The C++ side compiles to a single executable; the QML is embedded in it via Qt resources.
 
 <img width="3227" height="3227" alt="screenshot-2026-06-23_15-20-40" src="https://github.com/user-attachments/assets/c76047c8-618f-4c1c-91f9-e7024c4f953b" />

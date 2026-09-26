@@ -10,3 +10,8 @@ moc_*.cpp
 qrc_*.cpp
 .qmake.stash
 Makefile
+
+# .NET port
+dotnet/**/bin/
+dotnet/**/obj/
+*.user
