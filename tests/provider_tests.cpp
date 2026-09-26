@@ -420,6 +420,9 @@ void ProviderTests::nextcloudMakesFoldersUploadsAndShares() {
     FakeHttpServer server;
     QVERIFY(server.listen());
     server.responder = [&server](const FakeHttpServer::Request &request) -> FakeHttpServer::Response {
+        // The login name and the id files live under differ.
+        if (request.target == "/ocs/v1.php/cloud/user?format=json")
+            return {200, R"({"ocs":{"meta":{"statuscode":100},"data":{"id":"al ice"}}})", {}};
         if (request.method == "MKCOL")
             return {request.target.endsWith("/omacut") ? 405 : 201, {}, {}};
         if (request.method == "PUT")
@@ -431,7 +434,7 @@ void ProviderTests::nextcloudMakesFoldersUploadsAndShares() {
     const QVariantMap settings{
         {QStringLiteral("name"), QStringLiteral("Cloud")},
         {QStringLiteral("serverUrl"), server.url(QStringLiteral("/"))},
-        {QStringLiteral("username"), QStringLiteral("al ice")},
+        {QStringLiteral("username"), QStringLiteral("alice@example.com")},
         {QStringLiteral("appPassword"), QStringLiteral("app-pw")},
         {QStringLiteral("folder"), QStringLiteral("/omacut/%y")},
         {QStringLiteral("expireDays"), 3},
@@ -443,20 +446,21 @@ void ProviderTests::nextcloudMakesFoldersUploadsAndShares() {
     QCOMPARE(outcome.url, server.url(QStringLiteral("/s/AbC123/download")));
 
     const QString year = QDate::currentDate().toString(QStringLiteral("yyyy"));
-    QCOMPARE(server.requests.size(), 4);
+    QCOMPARE(server.requests.size(), 5);
+    QCOMPARE(server.requests.at(0).headers.value("ocs-apirequest"), QByteArray("true"));
     // An existing folder (405) is fine; each level is made in turn.
-    QCOMPARE(server.requests.at(0).method, QByteArray("MKCOL"));
-    QCOMPARE(server.requests.at(0).target, QByteArray("/remote.php/dav/files/al%20ice/omacut"));
-    QCOMPARE(server.requests.at(1).target,
+    QCOMPARE(server.requests.at(1).method, QByteArray("MKCOL"));
+    QCOMPARE(server.requests.at(1).target, QByteArray("/remote.php/dav/files/al%20ice/omacut"));
+    QCOMPARE(server.requests.at(2).target,
              QStringLiteral("/remote.php/dav/files/al%20ice/omacut/%1").arg(year).toLatin1());
-    const FakeHttpServer::Request &put = server.requests.at(2);
+    const FakeHttpServer::Request &put = server.requests.at(3);
     QCOMPARE(put.method, QByteArray("PUT"));
     QVERIFY(QRegularExpression(QStringLiteral("^/remote.php/dav/files/al%20ice/omacut/\\d{4}/clip_trimmed-[a-z0-9]{6}\\.mp4$"))
                 .match(QString::fromLatin1(put.target)).hasMatch());
-    QCOMPARE(put.headers.value("authorization"), "Basic " + QByteArray("al ice:app-pw").toBase64());
+    QCOMPARE(put.headers.value("authorization"), "Basic " + QByteArray("alice@example.com:app-pw").toBase64());
     QCOMPARE(put.body, QByteArray("fake mp4 bytes"));
 
-    const FakeHttpServer::Request &share = server.requests.at(3);
+    const FakeHttpServer::Request &share = server.requests.at(4);
     QCOMPARE(share.target, QByteArray("/ocs/v2.php/apps/files_sharing/api/v1/shares?format=json"));
     QCOMPARE(share.headers.value("ocs-apirequest"), QByteArray("true"));
     const QUrlQuery form(QString::fromUtf8(share.body));

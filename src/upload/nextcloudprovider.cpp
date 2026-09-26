@@ -54,14 +54,38 @@ public:
         m_folders = folderSegments(expandDateTokens(
             m_settings.value(QStringLiteral("folder")).toString(), QDateTime::currentDateTime()));
         m_fileName = taggedFileName(QFileInfo(filePath).fileName());
-        makeFolder(0);
+        findUserId();
     }
 
 private:
     QString davUrl(const QString &relativePath) const {
         return m_server + QStringLiteral("/remote.php/dav/files/")
-            + QString::fromLatin1(sigv4::uriEncode(m_user, true)) + QLatin1Char('/')
+            + QString::fromLatin1(sigv4::uriEncode(m_userId, true)) + QLatin1Char('/')
             + encodePath(relativePath);
+    }
+
+    QString authError(const Reply &reply) const {
+        return requestError(reply, reply.status == 401
+                                       ? QStringLiteral("check the user name and app password")
+                                       : QString());
+    }
+
+    // Files live under the user's id, which isn't always the name they
+    // sign in with (e-mail logins, LDAP).
+    void findUserId() {
+        QNetworkRequest request = authed(m_server + QStringLiteral("/ocs/v1.php/cloud/user?format=json"));
+        request.setRawHeader("OCS-APIRequest", "true");
+        send(request, "GET", QByteArray(), [this](const Reply &reply) {
+            m_userId = QJsonDocument::fromJson(reply.body).object()
+                           .value(QStringLiteral("ocs")).toObject()
+                           .value(QStringLiteral("data")).toObject()
+                           .value(QStringLiteral("id")).toString();
+            if (!reply.ok() || m_userId.isEmpty()) {
+                fail(authError(reply));
+                return;
+            }
+            makeFolder(0);
+        });
     }
 
     QNetworkRequest authed(const QString &url) const {
@@ -79,9 +103,7 @@ private:
         const QString path = m_folders.mid(0, depth + 1).join(QLatin1Char('/'));
         send(authed(davUrl(path)), "MKCOL", QByteArray(), [this, depth](const Reply &reply) {
             if (!reply.ok() && reply.status != 405) {
-                fail(requestError(reply, reply.status == 401
-                                             ? QStringLiteral("check the user name and app password")
-                                             : QString()));
+                fail(authError(reply));
                 return;
             }
             makeFolder(depth + 1);
@@ -144,6 +166,7 @@ private:
     const QString m_server;
     const QString m_user;
     const QByteArray m_auth;
+    QString m_userId;
     QIODevice *m_file = nullptr;
     QString m_mimeType;
     QStringList m_folders;
