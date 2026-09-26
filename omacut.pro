@@ -11,6 +11,7 @@ HEADERS += \
     src/thumbworker.h \
     src/thumbprovider.h \
     src/sxcu.h \
+    src/uploader.h \
     src/backend.h
 
 SOURCES += \
@@ -20,6 +21,7 @@ SOURCES += \
     src/thumbworker.cpp \
     src/thumbprovider.cpp \
     src/sxcu.cpp \
+    src/uploader.cpp \
     src/backend.cpp
 
 RESOURCES += src/resources.qrc
