@@ -71,7 +71,11 @@ public static class OmacutEditor
     /// </summary>
     public static async Task<string?> ShowAsync(OmacutEditorOptions options, Window? owner = null)
     {
-        var window = new OmacutWindow(options);
+        var window = new OmacutWindow(options)
+        {
+            WindowStartupLocation = owner != null ? WindowStartupLocation.CenterOwner : WindowStartupLocation.CenterScreen,
+        };
+        options.ConfigureWindow?.Invoke(window);
         if (owner != null)
         {
             await window.ShowDialog(owner);

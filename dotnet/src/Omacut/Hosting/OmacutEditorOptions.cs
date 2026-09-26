@@ -35,6 +35,9 @@ public sealed class OmacutEditorOptions
     /// <summary>Allow Q and Ctrl+O. Hosts editing one specific file can turn file switching off.</summary>
     public bool AllowOpeningOtherFiles { get; init; } = true;
 
+    /// <summary>Called with the editor window before it is shown (icon, placement, owner tweaks).</summary>
+    public Action<Avalonia.Controls.Window>? ConfigureWindow { get; init; }
+
     /// <summary>Diagnostics sink (ffmpeg failures, audio fallback).</summary>
     public Action<string>? Log { get; init; }
 }
