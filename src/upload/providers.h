@@ -2,6 +2,7 @@
 
 #include <QByteArray>
 #include <QList>
+#include <QString>
 
 // The providers omacut ships, one per source file.
 namespace upload {
@@ -23,6 +24,11 @@ const Provider *immichProvider();
 const Provider *xbackboneProvider();
 // Anonymous Imgur uploads with the user's own client ID.
 const Provider *imgurProvider();
+// SFTP, FTP and FTPS through curl.
+const Provider *ftpProvider();
+// Tries other hosts in order until one works.
+const Provider *autoProvider();
+QString autoProviderId();
 
 // The anonymous hosts offered out of the box, as .sxcu documents.
 QList<QByteArray> builtInDefinitions();

@@ -13,7 +13,9 @@ HEADERS += \
     $$PWD/sxcu.h
 
 SOURCES += \
+    $$PWD/autoprovider.cpp \
     $$PWD/dropboxprovider.cpp \
+    $$PWD/ftpprovider.cpp \
     $$PWD/hosts.cpp \
     $$PWD/httpjob.cpp \
     $$PWD/imgurprovider.cpp \

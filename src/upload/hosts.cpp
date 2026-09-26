@@ -330,8 +330,17 @@ Services Hosts::servicesFor(const QString &id) {
     Services services;
     services.network = m_network;
     services.saveSettings = [this, id](const QVariantMap &changes) { storeChanges(id, changes); };
-    services.createJob = [this](const QString &hostId, QObject *parent) {
-        return createJob(hostId, parent);
+    services.createJob = [this](const QString &hostId, QObject *parent, QString *error) -> Job * {
+        // Auto hosts only chain to real destinations, so they can't loop.
+        const Host *target = find(hostId);
+        Job *job = nullptr;
+        if (target && target->provider == autoProviderId())
+            m_lastError = QStringLiteral("An Auto host can't use another Auto host.");
+        else
+            job = createJob(hostId, parent);
+        if (!job && error)
+            *error = m_lastError;
+        return job;
     };
     services.openUrl = m_openUrl;
     return services;

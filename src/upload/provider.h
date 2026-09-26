@@ -60,8 +60,9 @@ struct Services {
     // Stores changed settings of the host being used, secrets included —
     // e.g. a refreshed access token.
     std::function<void(const QVariantMap &changes)> saveSettings;
-    // Makes a job for another configured host, for providers that delegate.
-    std::function<Job *(const QString &hostId, QObject *parent)> createJob;
+    // Makes a job for another configured host, for providers that delegate;
+    // null with the reason in error when it can't.
+    std::function<Job *(const QString &hostId, QObject *parent, QString *error)> createJob;
     // Opens a sign-in page in the browser.
     std::function<bool(const QUrl &url)> openUrl;
 };

@@ -62,9 +62,23 @@ private slots:
     void dropboxUploadsLargeFilesInASession();
     void dropboxReusesAnExistingLink();
     void dropboxAsksToSignInAgain();
+    void ftpHandsCurlItsConfigOnStdin();
+    void ftpUsesTlsWhenAsked();
+    void ftpReportsCurlErrors();
+    void ftpNeedsCurl();
+    void ftpCanBeCancelled();
+    void autoFallsBackToTheNextHost();
+    void autoReportsEveryFailure();
 
 private:
     QString writeClip(qint64 size = 0);
+    // Puts a fake curl first on PATH that keeps its stdin config in
+    // m_curlConfig, draws a progress bar and exits with exitCode.
+    void installFakeCurl(int exitCode = 0, const QByteArray &extra = {});
+    QVariantMap ftpSettings() const;
+    QByteArray m_oldPath;
+    QTemporaryDir m_curlDir;
+    QString m_curlConfig;
     QVariantMap s3Settings(const FakeHttpServer &server) const;
     // Recomputes the signature of a request the fake server received.
     bool signatureMatches(const FakeHttpServer::Request &request, const QString &secretKey) const;
@@ -72,6 +86,37 @@ private:
     QTemporaryDir m_dir;
     QNetworkAccessManager m_network;
 };
+
+void ProviderTests::installFakeCurl(int exitCode, const QByteArray &extra) {
+    if (m_oldPath.isEmpty())
+        m_oldPath = qgetenv("PATH");
+    m_curlConfig = m_curlDir.filePath(QStringLiteral("config.txt"));
+    QFile::remove(m_curlConfig);
+    QFile script(m_curlDir.filePath(QStringLiteral("curl")));
+    QVERIFY(script.open(QIODevice::WriteOnly | QIODevice::Truncate));
+    script.write("#!/bin/sh\ncat > '" + m_curlConfig.toUtf8() + "'\n"
+                 "printf '####      42.0%%\\r' >&2\n"
+                 "printf '######## 100.0%%\\r' >&2\n" + extra
+                 + "exit " + QByteArray::number(exitCode) + "\n");
+    script.close();
+    QVERIFY(script.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner));
+    qputenv("PATH", QFile::encodeName(m_curlDir.path()) + ':' + m_oldPath);
+}
+
+QVariantMap ProviderTests::ftpSettings() const {
+    return {
+        {QStringLiteral("name"), QStringLiteral("Server")},
+        {QStringLiteral("protocol"), QStringLiteral("SFTP")},
+        {QStringLiteral("host"), QStringLiteral("example.com")},
+        {QStringLiteral("port"), 2222},
+        {QStringLiteral("username"), QStringLiteral("me")},
+        {QStringLiteral("password"), QStringLiteral("p\"w\\d")},
+        {QStringLiteral("privateKey"), QStringLiteral("~/.ssh/id_ed25519")},
+        {QStringLiteral("directory"), QStringLiteral("clips/%y/")},
+        {QStringLiteral("publicUrl"), QStringLiteral("https://example.com/clips/")},
+        {QStringLiteral("uniqueNames"), false},
+    };
+}
 
 QString ProviderTests::writeClip(qint64 size) {
     const QString path = m_dir.filePath(QStringLiteral("clip_trimmed.mp4"));
@@ -842,6 +887,145 @@ void ProviderTests::dropboxAsksToSignInAgain() {
     outcome = runJob(
         dropboxProvider()->createJob(dropboxSettings(server), testServices(&m_network), nullptr), writeClip());
     QCOMPARE(outcome.error, QStringLiteral("Box answered HTTP 409: path/insufficient_space"));
+}
+
+void ProviderTests::ftpHandsCurlItsConfigOnStdin() {
+    installFakeCurl();
+    Job *job = ftpProvider()->createJob(ftpSettings(), testServices(&m_network), nullptr);
+    QList<qint64> progress;
+    connect(job, &Job::progress, job, [&progress](qint64 sent, qint64) { progress << sent; });
+    const QString path = writeClip();
+    const UploadOutcome outcome = runJob(job, path);
+    QVERIFY2(outcome.ok, qPrintable(outcome.error));
+    QCOMPARE(outcome.url, QStringLiteral("https://example.com/clips/clip_trimmed.mp4"));
+    QCOMPARE(progress.last(), QFileInfo(path).size());
+
+    QFile file(m_curlConfig);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    const QByteArray config = file.readAll();
+    const QString year = QDate::currentDate().toString(QStringLiteral("yyyy"));
+    QVERIFY2(config.contains("url = \"sftp://example.com:2222/clips/" + year.toLatin1() + "/clip_trimmed.mp4\"\n"),
+             config.constData());
+    QVERIFY(config.contains("upload-file = \"" + path.toUtf8() + "\"\n"));
+    // Quotes and backslashes in the password are escaped for curl.
+    QVERIFY(config.contains("user = \"me:p\\\"w\\\\d\"\n"));
+    QVERIFY(config.contains("key = \"" + QDir::homePath().toUtf8() + "/.ssh/id_ed25519\"\n"));
+    QVERIFY(config.contains("ftp-create-dirs\n"));
+    QVERIFY(!config.contains("ssl-reqd"));
+}
+
+void ProviderTests::ftpUsesTlsWhenAsked() {
+    installFakeCurl();
+    QVariantMap settings = ftpSettings();
+    settings.insert(QStringLiteral("protocol"), QStringLiteral("FTPS (explicit TLS)"));
+    settings.insert(QStringLiteral("port"), 0);
+    settings.insert(QStringLiteral("publicUrl"), QString());
+    settings.insert(QStringLiteral("uniqueNames"), true);
+    const UploadOutcome outcome =
+        runJob(ftpProvider()->createJob(settings, testServices(&m_network), nullptr), writeClip());
+    QVERIFY2(outcome.ok, qPrintable(outcome.error));
+    // Without a web address the link is the server's own.
+    QVERIFY(QRegularExpression(QStringLiteral("^ftp://example.com/clips/\\d{4}/clip_trimmed-[a-z0-9]{6}\\.mp4$"))
+                .match(outcome.url).hasMatch());
+
+    QFile file(m_curlConfig);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    const QByteArray config = file.readAll();
+    QVERIFY(config.contains("ssl-reqd\n"));
+    QVERIFY(!config.contains("key = "));
+}
+
+void ProviderTests::ftpReportsCurlErrors() {
+    installFakeCurl(67, "echo 'curl: (67) Access denied: 530' >&2\n");
+    const UploadOutcome outcome =
+        runJob(ftpProvider()->createJob(ftpSettings(), testServices(&m_network), nullptr), writeClip());
+    QCOMPARE(outcome.error, QStringLiteral("Server: Access denied: 530"));
+}
+
+void ProviderTests::ftpNeedsCurl() {
+    installFakeCurl();
+    QTemporaryDir empty;
+    qputenv("PATH", QFile::encodeName(empty.path()));
+    const UploadOutcome outcome =
+        runJob(ftpProvider()->createJob(ftpSettings(), testServices(&m_network), nullptr), writeClip());
+    qputenv("PATH", m_oldPath);
+    QVERIFY(outcome.error.startsWith(QStringLiteral("`curl` was not found")));
+}
+
+void ProviderTests::ftpCanBeCancelled() {
+    installFakeCurl(0, "sleep 5\n");
+    std::unique_ptr<Job> job(ftpProvider()->createJob(ftpSettings(), testServices(&m_network), nullptr));
+    QSignalSpy failed(job.get(), &Job::failed);
+    QSignalSpy progress(job.get(), &Job::progress);
+    job->start(writeClip());
+    QTRY_VERIFY(progress.count() > 0);
+    job->cancel();
+    QTRY_COMPARE(failed.count(), 1);
+    QCOMPARE(failed.first().first().toString(), QStringLiteral("Upload cancelled."));
+}
+
+void ProviderTests::autoFallsBackToTheNextHost() {
+    FakeHttpServer broken;
+    QVERIFY(broken.listen());
+    broken.status = 503;
+    broken.reply = "down";
+    FakeHttpServer working;
+    QVERIFY(working.listen());
+    working.reply = "https://files.example/ok.mp4";
+
+    QTemporaryDir config;
+    Hosts hosts(config.path(), std::make_unique<MemorySecretStore>());
+    hosts.setNetwork(&m_network);
+    const auto sxcuHost = [&hosts](const QString &name, const FakeHttpServer &server) {
+        sxcu::Destination d;
+        d.requestUrl = server.url();
+        d.fileFormName = QStringLiteral("f");
+        return hosts.save({}, QStringLiteral("sxcu"), name, {{QStringLiteral("definition"), sxcuJson(d)}});
+    };
+    const QString first = sxcuHost(QStringLiteral("Broken"), broken);
+    const QString second = sxcuHost(QStringLiteral("Working"), working);
+    const QString chain = hosts.save({}, QStringLiteral("auto"), QStringLiteral("Auto"),
+                                     {{QStringLiteral("hosts"), QStringList{first, second}}});
+    QVERIFY2(!chain.isEmpty(), qPrintable(hosts.lastError()));
+
+    const UploadOutcome outcome = runJob(hosts.createJob(chain, nullptr), writeClip());
+    QVERIFY2(outcome.ok, qPrintable(outcome.error));
+    QCOMPARE(outcome.url, QStringLiteral("https://files.example/ok.mp4"));
+    QCOMPARE(broken.requests.size(), 1);
+    QCOMPARE(working.requests.size(), 1);
+
+    // An empty chain can't be saved.
+    QVERIFY(hosts.save({}, QStringLiteral("auto"), QStringLiteral("Empty"),
+                       {{QStringLiteral("hosts"), QStringList()}}).isEmpty());
+    QCOMPARE(hosts.lastError(), QStringLiteral("Hosts to try, in order is required."));
+}
+
+void ProviderTests::autoReportsEveryFailure() {
+    FakeHttpServer broken;
+    QVERIFY(broken.listen());
+    broken.status = 500;
+    broken.reply = "boom";
+
+    QTemporaryDir config;
+    Hosts hosts(config.path(), std::make_unique<MemorySecretStore>());
+    hosts.setNetwork(&m_network);
+    sxcu::Destination d;
+    d.requestUrl = broken.url();
+    d.fileFormName = QStringLiteral("f");
+    const QString bad = hosts.save({}, QStringLiteral("sxcu"), QStringLiteral("Bad"),
+                                   {{QStringLiteral("definition"), sxcuJson(d)}});
+    const QString inner = hosts.save({}, QStringLiteral("auto"), QStringLiteral("Inner"),
+                                     {{QStringLiteral("hosts"), QStringList{bad}}});
+    const QString outer = hosts.save({}, QStringLiteral("auto"), QStringLiteral("Outer"),
+                                     {{QStringLiteral("hosts"), QStringList{bad, QStringLiteral("gone"), inner}}});
+    QVERIFY(!outer.isEmpty());
+
+    const UploadOutcome outcome = runJob(hosts.createJob(outer, nullptr), writeClip());
+    QVERIFY(!outcome.ok);
+    QCOMPARE(outcome.error, QStringLiteral("Every host failed. Bad answered HTTP 500: boom. "
+                                           "That host no longer exists. "
+                                           "An Auto host can't use another Auto host."));
+    QCOMPARE(broken.requests.size(), 1);
 }
 
 QTEST_GUILESS_MAIN(ProviderTests)

@@ -76,8 +76,10 @@ const QList<const Provider *> &providers() {
         nextcloudProvider(),
         immichProvider(),
         xbackboneProvider(),
+        ftpProvider(),
         imgurProvider(),
         sxcuProvider(),
+        autoProvider(),
     };
     return all;
 }
