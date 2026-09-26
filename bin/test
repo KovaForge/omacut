@@ -13,9 +13,12 @@ else
   exit 1
 fi
 
-mkdir -p "$BUILD_DIR"
-cd "$BUILD_DIR"
-
-"$QMAKE" "$ROOT/tests/backend_tests.pro"
-make
-./backend_tests
+for suite in backend_tests uploader_tests; do
+  mkdir -p "$BUILD_DIR/${suite%_tests}"
+  (
+    cd "$BUILD_DIR/${suite%_tests}"
+    "$QMAKE" "$ROOT/tests/$suite.pro"
+    make
+    "./$suite"
+  )
+done
