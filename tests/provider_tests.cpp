@@ -1,6 +1,7 @@
 #include <QtTest>
 
 #include <QCryptographicHash>
+#include <QNetworkReply>
 #include <QJsonArray>
 #include <QRegularExpression>
 #include <QUrlQuery>
@@ -56,6 +57,11 @@ private slots:
     void xbackboneUploadsWithEitherApi();
     void imgurUploadsVideosAnonymously();
     void everyProviderDescribesItsFields();
+    void dropboxSignInTradesACodeForARefreshToken();
+    void dropboxUploadsAndSharesALink();
+    void dropboxUploadsLargeFilesInASession();
+    void dropboxReusesAnExistingLink();
+    void dropboxAsksToSignInAgain();
 
 private:
     QString writeClip(qint64 size = 0);
@@ -624,6 +630,218 @@ void ProviderTests::everyProviderDescribesItsFields() {
     }
     QCOMPARE(ids.size(), QSet<QString>(ids.begin(), ids.end()).size());
     QVERIFY(!findProvider(QStringLiteral("missing")));
+}
+
+static QVariantMap dropboxSettings(const FakeHttpServer &server) {
+    return {
+        {QStringLiteral("name"), QStringLiteral("Box")},
+        {QStringLiteral("appKey"), QStringLiteral("app-key")},
+        {QStringLiteral("refreshToken"), QStringLiteral("refresh-1")},
+        {QStringLiteral("folder"), QStringLiteral("/omacut/")},
+        {QStringLiteral("baseUrl"), server.url(QString())},
+    };
+}
+
+// Answers the Dropbox API the way a working account would.
+static FakeHttpServer::Response dropboxApi(const FakeHttpServer::Request &request) {
+    if (request.target == "/oauth2/token")
+        return {200, R"({"access_token":"access-1","token_type":"bearer","expires_in":14400})", {}};
+    if (request.target.startsWith("/2/files/upload_session/start"))
+        return {200, R"({"session_id":"sess-1"})", {}};
+    if (request.target.startsWith("/2/files/upload_session/append_v2"))
+        return {200, "null", {}};
+    if (request.target.startsWith("/2/files/upload"))
+        return {200, R"({"name":"clip_trimmed.mp4","path_lower":"/omacut/clip_trimmed.mp4"})", {}};
+    if (request.target == "/2/sharing/create_shared_link_with_settings")
+        return {200, R"({"url":"https://www.dropbox.com/scl/fi/abc/clip_trimmed.mp4?rlkey=k&dl=0"})", {}};
+    return {404, {}, {}};
+}
+
+void ProviderTests::dropboxSignInTradesACodeForARefreshToken() {
+    FakeHttpServer server;
+    QVERIFY(server.listen());
+    server.responder = [](const FakeHttpServer::Request &request) -> FakeHttpServer::Response {
+        if (request.target == "/oauth2/token")
+            return {200, R"({"access_token":"a","refresh_token":"refresh-new"})", {}};
+        return {200, R"({"name":{"display_name":"Ada"}})", {}};
+    };
+
+    // A free port for the loopback redirect.
+    QTcpServer probe;
+    QVERIFY(probe.listen(QHostAddress::LocalHost));
+    const QString redirect = QStringLiteral("http://127.0.0.1:%1/oauth2/callback").arg(probe.serverPort());
+    probe.close();
+
+    QTemporaryDir config;
+    auto store = std::make_unique<MemorySecretStore>();
+    MemorySecretStore *secrets = store.get();
+    Hosts hosts(config.path(), std::move(store));
+    hosts.setNetwork(&m_network);
+    QUrl authorizeUrl;
+    hosts.setUrlOpener([&authorizeUrl](const QUrl &url) {
+        authorizeUrl = url;
+        return true;
+    });
+
+    // Without the app key there's nothing to sign in with.
+    QSignalSpy finished(&hosts, &Hosts::authorizeFinished);
+    hosts.authorize({}, QStringLiteral("dropbox"), {});
+    QCOMPARE(finished.count(), 1);
+    QCOMPARE(finished.takeFirst().at(0).toString(), QStringLiteral("Enter your Dropbox app key first."));
+
+    const QVariantMap draft{{QStringLiteral("appKey"), QStringLiteral("app-key")},
+                            {QStringLiteral("redirectUri"), redirect},
+                            {QStringLiteral("baseUrl"), server.url(QString())}};
+    hosts.authorize({}, QStringLiteral("dropbox"), draft);
+    QTRY_VERIFY(authorizeUrl.isValid());
+    const QUrlQuery asked(authorizeUrl);
+    QCOMPARE(authorizeUrl.path(), QStringLiteral("/oauth2/authorize"));
+    QCOMPARE(asked.queryItemValue(QStringLiteral("client_id")), QStringLiteral("app-key"));
+    QCOMPARE(asked.queryItemValue(QStringLiteral("token_access_type")), QStringLiteral("offline"));
+    QCOMPARE(asked.queryItemValue(QStringLiteral("code_challenge_method")), QStringLiteral("S256"));
+    QCOMPARE(asked.queryItemValue(QStringLiteral("redirect_uri"), QUrl::FullyDecoded), redirect);
+    const QString state = asked.queryItemValue(QStringLiteral("state"));
+
+    // A redirect with someone else's state is turned away.
+    QNetworkReply *forged = m_network.get(QNetworkRequest(QUrl(redirect + QStringLiteral("?code=x&state=nope"))));
+    QTRY_VERIFY(forged->isFinished());
+    QVERIFY(forged->readAll().contains("doesn't match"));
+    forged->deleteLater();
+    QCOMPARE(finished.count(), 0);
+
+    // The browser comes back with the code.
+    QNetworkReply *callback = m_network.get(QNetworkRequest(
+        QUrl(redirect + QStringLiteral("?code=the-code&state=") + state)));
+    QTRY_VERIFY(callback->isFinished());
+    QVERIFY(callback->readAll().contains("Dropbox is connected"));
+    callback->deleteLater();
+    QTRY_COMPARE(finished.count(), 1);
+    QCOMPARE(finished.first().at(0).toString(), QString());
+    QCOMPARE(finished.first().at(1).toString(), QStringLiteral("Connected as Ada"));
+
+    const QUrlQuery exchange(QString::fromUtf8(server.requests.at(0).body));
+    QCOMPARE(exchange.queryItemValue(QStringLiteral("grant_type")), QStringLiteral("authorization_code"));
+    QCOMPARE(exchange.queryItemValue(QStringLiteral("code")), QStringLiteral("the-code"));
+    // The verifier sent now is the one the challenge was made from.
+    const QByteArray verifier = exchange.queryItemValue(QStringLiteral("code_verifier")).toLatin1();
+    QCOMPARE(QCryptographicHash::hash(verifier, QCryptographicHash::Sha256)
+                 .toBase64(QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals),
+             asked.queryItemValue(QStringLiteral("code_challenge")).toLatin1());
+    QCOMPARE(server.requests.at(1).headers.value("authorization"), QByteArray("Bearer a"));
+
+    // Saving keeps the refresh token as a secret, never in hosts.json.
+    const QString id = hosts.save({}, QStringLiteral("dropbox"), QStringLiteral("Box"),
+                                  {{QStringLiteral("appKey"), QStringLiteral("app-key")}});
+    QVERIFY2(!id.isEmpty(), qPrintable(hosts.lastError()));
+    QCOMPARE(secrets->read(id + QStringLiteral("/refreshToken")), QStringLiteral("refresh-new"));
+    QFile file(config.filePath(QStringLiteral("hosts.json")));
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    QVERIFY(!file.readAll().contains("refresh-new"));
+
+    // A host that never signed in can't be saved.
+    QVERIFY(hosts.save({}, QStringLiteral("dropbox"), QStringLiteral("Box 2"),
+                       {{QStringLiteral("appKey"), QStringLiteral("k")}}).isEmpty());
+    QCOMPARE(hosts.lastError(), QStringLiteral("Sign in with Dropbox first."));
+}
+
+void ProviderTests::dropboxUploadsAndSharesALink() {
+    FakeHttpServer server;
+    QVERIFY(server.listen());
+    server.responder = dropboxApi;
+
+    QVariantMap settings = dropboxSettings(server);
+    UploadOutcome outcome =
+        runJob(dropboxProvider()->createJob(settings, testServices(&m_network), nullptr), writeClip());
+    QVERIFY2(outcome.ok, qPrintable(outcome.error));
+    QCOMPARE(outcome.url, QStringLiteral("https://www.dropbox.com/scl/fi/abc/clip_trimmed.mp4?rlkey=k&dl=0"));
+
+    QCOMPARE(server.requests.size(), 3);
+    const QUrlQuery refresh(QString::fromUtf8(server.requests.at(0).body));
+    QCOMPARE(refresh.queryItemValue(QStringLiteral("grant_type")), QStringLiteral("refresh_token"));
+    QCOMPARE(refresh.queryItemValue(QStringLiteral("refresh_token")), QStringLiteral("refresh-1"));
+    QCOMPARE(refresh.queryItemValue(QStringLiteral("client_id")), QStringLiteral("app-key"));
+
+    const FakeHttpServer::Request &upload = server.requests.at(1);
+    QCOMPARE(upload.target, QByteArray("/2/files/upload"));
+    QCOMPARE(upload.headers.value("authorization"), QByteArray("Bearer access-1"));
+    const QJsonObject arg = QJsonDocument::fromJson(upload.headers.value("dropbox-api-arg")).object();
+    QCOMPARE(arg.value(QStringLiteral("path")).toString(), QStringLiteral("/omacut/clip_trimmed.mp4"));
+    QCOMPARE(arg.value(QStringLiteral("mode")).toString(), QStringLiteral("add"));
+    QCOMPARE(arg.value(QStringLiteral("autorename")).toBool(), true);
+    QCOMPARE(upload.body, QByteArray("fake mp4 bytes"));
+    QCOMPARE(QJsonDocument::fromJson(server.requests.at(2).body).object()
+                 .value(QStringLiteral("path")).toString(),
+             QStringLiteral("/omacut/clip_trimmed.mp4"));
+
+    settings.insert(QStringLiteral("directLink"), true);
+    outcome = runJob(dropboxProvider()->createJob(settings, testServices(&m_network), nullptr), writeClip());
+    QCOMPARE(outcome.url, QStringLiteral("https://www.dropbox.com/scl/fi/abc/clip_trimmed.mp4?rlkey=k&raw=1"));
+}
+
+void ProviderTests::dropboxUploadsLargeFilesInASession() {
+    FakeHttpServer server;
+    QVERIFY(server.listen());
+    server.responder = dropboxApi;
+
+    QVariantMap settings = dropboxSettings(server);
+    settings.insert(QStringLiteral("chunkSize"), 1000);
+    const UploadOutcome outcome =
+        runJob(dropboxProvider()->createJob(settings, testServices(&m_network), nullptr), writeClip(2500));
+    QVERIFY2(outcome.ok, qPrintable(outcome.error));
+
+    QStringList targets;
+    for (const FakeHttpServer::Request &request : std::as_const(server.requests))
+        targets << QString::fromLatin1(request.target);
+    QCOMPARE(targets, (QStringList{QStringLiteral("/oauth2/token"),
+                                   QStringLiteral("/2/files/upload_session/start"),
+                                   QStringLiteral("/2/files/upload_session/append_v2"),
+                                   QStringLiteral("/2/files/upload_session/finish"),
+                                   QStringLiteral("/2/sharing/create_shared_link_with_settings")}));
+    const auto arg = [&server](int i) {
+        return QJsonDocument::fromJson(server.requests.at(i).headers.value("dropbox-api-arg")).object();
+    };
+    QCOMPARE(server.requests.at(1).body.size(), 1000);
+    QCOMPARE(arg(2).value(QStringLiteral("cursor")).toObject().value(QStringLiteral("offset")).toInt(), 1000);
+    QCOMPARE(arg(2).value(QStringLiteral("cursor")).toObject().value(QStringLiteral("session_id")).toString(),
+             QStringLiteral("sess-1"));
+    QCOMPARE(arg(3).value(QStringLiteral("cursor")).toObject().value(QStringLiteral("offset")).toInt(), 2000);
+    QCOMPARE(arg(3).value(QStringLiteral("commit")).toObject().value(QStringLiteral("path")).toString(),
+             QStringLiteral("/omacut/clip_trimmed.mp4"));
+    QCOMPARE(server.requests.at(3).body.size(), 500);
+}
+
+void ProviderTests::dropboxReusesAnExistingLink() {
+    FakeHttpServer server;
+    QVERIFY(server.listen());
+    server.responder = [](const FakeHttpServer::Request &request) -> FakeHttpServer::Response {
+        if (request.target == "/2/sharing/create_shared_link_with_settings") {
+            return {409, R"({"error_summary":"shared_link_already_exists/metadata/..","error":{".tag":"shared_link_already_exists","shared_link_already_exists":{"metadata":{"url":"https://www.dropbox.com/s/old?dl=0"}}}})", {}};
+        }
+        return dropboxApi(request);
+    };
+    const UploadOutcome outcome = runJob(
+        dropboxProvider()->createJob(dropboxSettings(server), testServices(&m_network), nullptr), writeClip());
+    QVERIFY2(outcome.ok, qPrintable(outcome.error));
+    QCOMPARE(outcome.url, QStringLiteral("https://www.dropbox.com/s/old?dl=0"));
+}
+
+void ProviderTests::dropboxAsksToSignInAgain() {
+    FakeHttpServer server;
+    QVERIFY(server.listen());
+    server.status = 400;
+    server.reply = R"({"error":"invalid_grant","error_description":"refresh token is invalid or revoked"})";
+    UploadOutcome outcome = runJob(
+        dropboxProvider()->createJob(dropboxSettings(server), testServices(&m_network), nullptr), writeClip());
+    QCOMPARE(outcome.error, QStringLiteral("Box needs signing in again."));
+
+    server.responder = [](const FakeHttpServer::Request &request) -> FakeHttpServer::Response {
+        if (request.target == "/2/files/upload")
+            return {409, R"({"error_summary":"path/insufficient_space/..."})", {}};
+        return dropboxApi(request);
+    };
+    outcome = runJob(
+        dropboxProvider()->createJob(dropboxSettings(server), testServices(&m_network), nullptr), writeClip());
+    QCOMPARE(outcome.error, QStringLiteral("Box answered HTTP 409: path/insufficient_space"));
 }
 
 QTEST_GUILESS_MAIN(ProviderTests)

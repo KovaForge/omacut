@@ -15,6 +15,8 @@ const Provider *sxcuProvider();
 const Provider *s3Provider();
 // WebDAV upload plus a public share link, with Login Flow v2 sign-in.
 const Provider *nextcloudProvider();
+// Dropbox with a PKCE browser sign-in and the user's own app key.
+const Provider *dropboxProvider();
 // An asset in an Immich library, optionally shared.
 const Provider *immichProvider();
 // A self-hosted XBackBone instance.

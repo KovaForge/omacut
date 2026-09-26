@@ -72,6 +72,7 @@ QVariantMap Provider::withDefaults(const QVariantMap &settings) const {
 const QList<const Provider *> &providers() {
     static const QList<const Provider *> all = {
         s3Provider(),
+        dropboxProvider(),
         nextcloudProvider(),
         immichProvider(),
         xbackboneProvider(),
