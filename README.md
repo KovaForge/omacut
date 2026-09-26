@@ -29,18 +29,35 @@ Install via the Omarchy Package Repository via the `omacut` package. It's instal
 
 - `xdg-desktop-portal` and a portal backend for the file picker
 - `ffmpeg` and `ffprobe` on your PATH (used at runtime)
+- Optionally `wl-clipboard` (uploaded links outlive omacut), `libsecret` (host passwords in the keyring) and `curl` (FTP and SFTP hosts)
 
 Exports are always written as MP4 files, regardless of the input video's container. The export dialog offers Original/1080p/720p quality — never upscaling, and always preserving the aspect ratio.
 
 ## Upload
 
-*Ctrl+U* (or the upload button) encodes the trim just like an export and sends it to a file host. Pick the host and quality with the arrow keys, press Enter, and the link lands on your clipboard when it's done. Built in are three anonymous hosts, no account needed:
+*Ctrl+U* (or the upload button) encodes the trim just like an export and sends it to a host. Pick the host and quality with the arrow keys, press Enter, and the link lands on your clipboard when it's done. Three anonymous hosts are built in, no account needed:
 
 - **Litterbox**: deleted after 72 hours, up to 1 GB (the default)
 - **Catbox**: kept, up to 200 MB
 - **Uguu**: deleted after 3 hours, up to 128 MiB
 
-Add your own hosts as ShareX custom uploader (`.sxcu`) files in `~/.config/omacut/uploaders/`, so configs from ShareX or XerahS work unchanged. Destinations with a multipart body (`FileFormName`) or a `Binary` body are supported, and responses are read with the `{response}`, `{json:path}`, `{regex:pattern|group}`, `{header:name}` and `{filename}` syntax. For example, `0x0.st.sxcu`:
+### Your own hosts
+
+*Hosts…* in the upload dialog adds, edits and removes your own hosts:
+
+- **Amazon S3 or compatible**: AWS S3, Cloudflare R2, Backblaze B2, Wasabi, MinIO and others. Set the endpoint and region, and choose a public URL, a custom domain or a signed link (valid for 7 days) for private buckets. Large files go up in parts.
+- **Dropbox**: create an app at [dropbox.com/developers/apps](https://www.dropbox.com/developers/apps) with the `files.content.write` and `sharing.write` permissions, add `http://127.0.0.1:52475/oauth2/callback` as its redirect URI, enter its app key and click *Sign in with Dropbox*.
+- **Nextcloud**: *Sign in with Nextcloud* grants an app password in the browser (or paste one). The clip gets a public share link, optionally expiring.
+- **Immich**: adds the clip to your library with an API key, and shares a link to it.
+- **XBackBone**: the upload token from your profile, for XBackBone 3 or the newer API.
+- **FTP / SFTP**: SFTP, FTP or FTPS through `curl`. For SFTP, the server must already be in `~/.ssh/known_hosts`. Set the folder's web address so links point there.
+- **Imgur**: anonymous uploads with your own client ID (videos up to 200 MB and 60 seconds).
+- **Custom uploader (.sxcu)**: paste any ShareX custom uploader config.
+- **Auto**: tries the hosts you pick, in order, and uses the first one that works.
+
+Hosts are saved in `~/.config/omacut/hosts.json`. Passwords, keys and tokens never go there: they're kept in your desktop keyring through `secret-tool` (libsecret), or, without a keyring, in `~/.local/share/omacut/secrets.json`, readable only by you. Folder settings accept `%y`, `%mo` and `%d` for the date. Uploads to S3, Nextcloud and FTP get a short random tag in the name, so a new trim never replaces an old one.
+
+ShareX custom uploader (`.sxcu`) files dropped in `~/.config/omacut/uploaders/` show up as hosts too, so configs from ShareX or XerahS work unchanged. Destinations with a multipart body (`FileFormName`) or a `Binary` body are supported, and responses are read with the `{response}`, `{json:path}`, `{regex:pattern|group}`, `{header:name}` and `{filename}` syntax. For example, `0x0.st.sxcu`:
 
 ```json
 {
