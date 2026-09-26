@@ -170,6 +170,7 @@ private:
     QStringList m_uploadDestinationNames;
     int m_uploadDestination = -1;
     QString m_uploadDestinationName;
+    QString m_uploadSource;
     std::unique_ptr<QTemporaryDir> m_uploadDir;
     std::function<void(const QString &)> m_copyLink;
     bool m_uploading = false;

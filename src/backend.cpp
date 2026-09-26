@@ -528,6 +528,7 @@ void Backend::uploadClip(double start, double end, int scaleHeight) {
     const sxcu::Destination destination = m_uploadDestinations.at(m_uploadDestination);
     m_uploading = true;
     m_uploadCancelled = false;
+    m_uploadSource = m_path;
     m_uploadStart = start;
     m_uploadEnd = end;
     emit uploadingChanged();
@@ -573,7 +574,7 @@ void Backend::appendUploadHistory(const QString &url, const QString &thumbnailUr
     QJsonObject entry{
         {QStringLiteral("time"), QDateTime::currentDateTime().toString(Qt::ISODate)},
         {QStringLiteral("destination"), m_uploadDestinationName},
-        {QStringLiteral("source"), m_path},
+        {QStringLiteral("source"), m_uploadSource},
         {QStringLiteral("start"), m_uploadStart},
         {QStringLiteral("end"), m_uploadEnd},
         {QStringLiteral("url"), url},

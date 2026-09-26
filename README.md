@@ -47,8 +47,7 @@ Add your own hosts as ShareX custom uploader (`.sxcu`) files in `~/.config/omacu
   "Name": "0x0.st",
   "RequestURL": "https://0x0.st",
   "Body": "MultipartFormData",
-  "FileFormName": "file",
-  "DeletionURL": "{header:X-Token}"
+  "FileFormName": "file"
 }
 ```
 
