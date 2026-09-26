@@ -81,6 +81,20 @@ string? exported = await OmacutEditor.ShowAsync(new OmacutEditorOptions
 
 `EditorView` is a plain control if you'd rather host it yourself.
 
+**Single-file hosts:** keep the OpenAL Soft library (`libopenal.so`, `libopenal.dylib`, or `soft_oal.dll`) next to your executable rather than inside the bundle. Silk.NET's loader doesn't look in the bundle's extraction folder, so a bundled copy is never found and audio falls back to the system OpenAL, which Windows doesn't have. The fix in the host project:
+
+```xml
+<Target Name="KeepOpenAlOutOfSingleFileBundle" AfterTargets="ComputeResolvedFilesToPublishList">
+  <ItemGroup>
+    <ResolvedFileToPublish Update="@(ResolvedFileToPublish)"
+                           Condition="'%(Filename)%(Extension)' == 'libopenal.so' Or '%(Filename)%(Extension)' == 'libopenal.dylib' Or '%(Filename)%(Extension)' == 'soft_oal.dll'"
+                           ExcludeFromSingleFile="true" />
+  </ItemGroup>
+</Target>
+```
+
+If no OpenAL can be loaded at all, the editor still works; playback is just muted, and the mute button explains why.
+
 ## Layout
 
 - `src/Omacut` (`Omacut.Editor.dll`): the core, playback, controls and hosting API.
