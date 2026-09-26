@@ -8,6 +8,8 @@
 #include <QTcpServer>
 #include <QTcpSocket>
 
+#include <functional>
+
 // Answers every request on localhost with a canned response and keeps what
 // was sent, so uploads can be checked without touching a real host.
 class FakeHttpServer : public QObject {
@@ -21,9 +23,17 @@ public:
         QByteArray body;
     };
 
+    struct Response {
+        int status = 200;
+        QByteArray body;
+        QList<QPair<QByteArray, QByteArray>> headers;
+    };
+
     int status = 200;
     QByteArray reply;
     QList<QPair<QByteArray, QByteArray>> replyHeaders;
+    // When set, decides each response instead of the canned one above.
+    std::function<Response(const Request &)> responder;
     QList<Request> requests;
 
     FakeHttpServer() {
@@ -66,11 +76,12 @@ private:
         m_buffers.remove(socket);
         requests << request;
 
-        QByteArray response = "HTTP/1.1 " + QByteArray::number(status) + " Whatever\r\n";
-        for (const auto &[name, value] : replyHeaders)
+        const Response answer = responder ? responder(request) : Response{status, reply, replyHeaders};
+        QByteArray response = "HTTP/1.1 " + QByteArray::number(answer.status) + " Whatever\r\n";
+        for (const auto &[name, value] : answer.headers)
             response += name + ": " + value + "\r\n";
-        response += "Content-Length: " + QByteArray::number(reply.size())
-            + "\r\nConnection: close\r\n\r\n" + reply;
+        response += "Content-Length: " + QByteArray::number(answer.body.size())
+            + "\r\nConnection: close\r\n\r\n" + answer.body;
         socket->write(response);
         socket->disconnectFromHost();
     }

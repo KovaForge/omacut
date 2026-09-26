@@ -13,7 +13,7 @@ else
   exit 1
 fi
 
-for suite in backend_tests uploader_tests; do
+for suite in backend_tests uploader_tests provider_tests; do
   mkdir -p "$BUILD_DIR/${suite%_tests}"
   (
     cd "$BUILD_DIR/${suite%_tests}"

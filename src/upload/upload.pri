@@ -9,12 +9,15 @@ HEADERS += \
     $$PWD/provider.h \
     $$PWD/providers.h \
     $$PWD/secretstore.h \
+    $$PWD/sigv4.h \
     $$PWD/sxcu.h
 
 SOURCES += \
     $$PWD/hosts.cpp \
     $$PWD/httpjob.cpp \
     $$PWD/provider.cpp \
+    $$PWD/s3provider.cpp \
     $$PWD/secretstore.cpp \
+    $$PWD/sigv4.cpp \
     $$PWD/sxcu.cpp \
     $$PWD/sxcuprovider.cpp
