@@ -74,6 +74,21 @@ public class EditorViewTests
     }
 
     [AvaloniaTest]
+    public async Task PausedPlayheadStaysPut()
+    {
+        // Regression: an auto-started render timer used to park the paused playhead at the end.
+        (Window window, EditorView editor) = await OpenAsync();
+        for (int i = 0; i < 10; i++)
+        {
+            await Task.Delay(20);
+            Dispatcher.UIThread.RunJobs();
+        }
+
+        Assert.That(editor.Trim.Playhead, Is.EqualTo(0));
+        window.Close();
+    }
+
+    [AvaloniaTest]
     public async Task KeyboardTrimsAndUnexportedEditsAskBeforeQuitting()
     {
         (Window window, EditorView editor) = await OpenAsync();

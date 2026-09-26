@@ -127,14 +127,19 @@ public sealed class EditorView : UserControl, IDisposable
             }
         }
 
-        _renderTimer = new DispatcherTimer(TimeSpan.FromMilliseconds(8), DispatcherPriority.Render, OnRenderTick);
-        _thumbRevealTimer = new DispatcherTimer(TimeSpan.FromMilliseconds(ThumbRevealMs), DispatcherPriority.Background, (_, _) => RevealNextThumb());
-        _noticeTimer = new DispatcherTimer(TimeSpan.FromSeconds(5), DispatcherPriority.Background, (_, _) =>
+        // The (interval, priority, callback) constructor starts a DispatcherTimer immediately, so
+        // create them stopped and start each one only when it has work to do.
+        _renderTimer = new DispatcherTimer(DispatcherPriority.Render) { Interval = TimeSpan.FromMilliseconds(8) };
+        _renderTimer.Tick += OnRenderTick;
+        _thumbRevealTimer = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(ThumbRevealMs) };
+        _thumbRevealTimer.Tick += (_, _) => RevealNextThumb();
+        _noticeTimer = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromSeconds(5) };
+        _noticeTimer.Tick += (_, _) =>
         {
-            _noticeTimer!.Stop();
+            _noticeTimer.Stop();
             _notice = string.Empty;
             UpdateStatus();
-        });
+        };
 
         Background = Palette.BackgroundBrush;
         Focusable = true;
@@ -499,6 +504,13 @@ public sealed class EditorView : UserControl, IDisposable
 
     private void OnRenderTick(object? sender, EventArgs e)
     {
+        if (!IsPlaying)
+        {
+            _renderTimer.Stop();
+            UpdateChrome();
+            return;
+        }
+
         VideoFrame? frame = _engine.TakeDueFrame(out bool ended);
         if (frame != null)
         {
@@ -512,7 +524,7 @@ public sealed class EditorView : UserControl, IDisposable
             UpdateStatus();
         }
 
-        if (ended || !IsPlaying)
+        if (ended)
         {
             // Stop at the trim end, like a clip preview.
             _engine.Pause();
