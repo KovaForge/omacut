@@ -21,6 +21,13 @@ ApplicationWindow {
     property string noticeText: ""
     property bool helpVisible: false
     property bool quitConfirmVisible: false
+    property bool uploadVisible: false
+    // Either dialog quiets the playback and trim keys, so they reach it.
+    readonly property bool modalVisible: quitConfirmVisible || uploadVisible
+    // 0 uploads at the original size, otherwise a downscale height.
+    property int uploadHeight: 0
+    // Filled when the dialog opens, from the loaded video's size.
+    property var uploadHeightChoices: [0]
     readonly property string statusText: noticeText !== "" ? noticeText : backend.status
 
     // What the last export wrote, so quitting only warns about unexported work.
@@ -54,6 +61,39 @@ ApplicationWindow {
         pendingExportStartSec = trimBar.startSec;
         pendingExportEndSec = trimBar.endSec;
         backend.exportDialog(trimBar.startSec, trimBar.endSec);
+    }
+    function showUpload() {
+        if (!win.hasVideo || backend.duration <= 0 || backend.busy)
+            return;
+        backend.reloadUploadDestinations();
+        win.uploadHeightChoices = [0].concat(backend.uploadHeights());
+        if (win.uploadHeightChoices.indexOf(win.uploadHeight) < 0)
+            win.uploadHeight = 0;
+        win.quitConfirmVisible = false;
+        win.helpVisible = false;
+        win.uploadVisible = true;
+    }
+    function uploadVideo() {
+        win.uploadVisible = false;
+        if (!win.hasVideo || backend.duration <= 0 || backend.busy
+                || backend.uploadDestinations.length === 0)
+            return;
+        pendingExportStartSec = trimBar.startSec;
+        pendingExportEndSec = trimBar.endSec;
+        backend.uploadClip(trimBar.startSec, trimBar.endSec, win.uploadHeight);
+    }
+    function stepUploadDestination(delta) {
+        var count = backend.uploadDestinations.length;
+        if (count > 0)
+            backend.uploadDestination = (backend.uploadDestination + delta + count) % count;
+    }
+    function stepUploadHeight(delta) {
+        var choices = win.uploadHeightChoices;
+        var i = Math.max(0, choices.indexOf(win.uploadHeight));
+        win.uploadHeight = choices[Math.max(0, Math.min(i + delta, choices.length - 1))];
+    }
+    function heightLabel(height) {
+        return height === 0 ? "Original" : height + "p";
     }
     function ensureAudioOutput() {
         if (audioOutput === null && win.hasVideo)
@@ -164,70 +204,70 @@ ApplicationWindow {
     Shortcut {
         sequence: "Space"
         context: Qt.ApplicationShortcut
-        enabled: win.hasVideo && !win.quitConfirmVisible
+        enabled: win.hasVideo && !win.modalVisible
         onActivated: togglePlay()
     }
 
     Shortcut {
         sequence: "Ctrl+Space"
         context: Qt.ApplicationShortcut
-        enabled: win.hasVideo && !win.quitConfirmVisible
+        enabled: win.hasVideo && !win.modalVisible
         onActivated: moveTrimStartTo(trimBar.playheadSec)
     }
 
     Shortcut {
         sequence: "Alt+Space"
         context: Qt.ApplicationShortcut
-        enabled: win.hasVideo && !win.quitConfirmVisible
+        enabled: win.hasVideo && !win.modalVisible
         onActivated: moveTrimEndTo(trimBar.playheadSec)
     }
 
     Shortcut {
         sequence: "Left"
         context: Qt.ApplicationShortcut
-        enabled: win.hasVideo && !win.quitConfirmVisible
+        enabled: win.hasVideo && !win.modalVisible
         onActivated: seekBy(-1)
     }
 
     Shortcut {
         sequence: "Right"
         context: Qt.ApplicationShortcut
-        enabled: win.hasVideo && !win.quitConfirmVisible
+        enabled: win.hasVideo && !win.modalVisible
         onActivated: seekBy(1)
     }
 
     Shortcut {
         sequence: "Shift+Left"
         context: Qt.ApplicationShortcut
-        enabled: win.hasVideo && !win.quitConfirmVisible
+        enabled: win.hasVideo && !win.modalVisible
         onActivated: seekBy(-5)
     }
 
     Shortcut {
         sequence: "Shift+Right"
         context: Qt.ApplicationShortcut
-        enabled: win.hasVideo && !win.quitConfirmVisible
+        enabled: win.hasVideo && !win.modalVisible
         onActivated: seekBy(5)
     }
 
     Shortcut {
         sequence: "Alt+Left"
         context: Qt.ApplicationShortcut
-        enabled: win.hasVideo && !win.quitConfirmVisible
+        enabled: win.hasVideo && !win.modalVisible
         onActivated: seekBy(-0.2)
     }
 
     Shortcut {
         sequence: "Alt+Right"
         context: Qt.ApplicationShortcut
-        enabled: win.hasVideo && !win.quitConfirmVisible
+        enabled: win.hasVideo && !win.modalVisible
         onActivated: seekBy(0.2)
     }
 
     Shortcut {
         sequence: "Z"
         context: Qt.ApplicationShortcut
-        enabled: win.hasVideo && backend.duration > 0 && !win.quitConfirmVisible
+        enabled: win.hasVideo && backend.duration > 0 && !win.modalVisible
         onActivated: {
             trimBar.toggleZoom();
             backend.requestThumbs(trimBar.windowStart, trimBar.windowEnd);
@@ -240,14 +280,22 @@ ApplicationWindow {
         enabled: win.hasVideo && backend.duration > 0 && !backend.busy
         onActivated: {
             win.quitConfirmVisible = false;
+            win.uploadVisible = false;
             exportVideo();
         }
     }
 
     Shortcut {
+        sequence: "Ctrl+U"
+        context: Qt.ApplicationShortcut
+        enabled: win.hasVideo && backend.duration > 0 && !backend.busy && !win.uploadVisible
+        onActivated: showUpload()
+    }
+
+    Shortcut {
         sequence: "Ctrl+O"
         context: Qt.ApplicationShortcut
-        enabled: !win.quitConfirmVisible
+        enabled: !win.modalVisible
         onActivated: openVideo()
     }
 
@@ -255,7 +303,7 @@ ApplicationWindow {
         sequence: "Q"
         context: Qt.ApplicationShortcut
         onActivated: {
-            if (!win.quitConfirmVisible)
+            if (!win.modalVisible)
                 requestQuit();
         }
     }
@@ -264,7 +312,7 @@ ApplicationWindow {
         sequence: "?"
         context: Qt.ApplicationShortcut
         onActivated: {
-            if (!win.quitConfirmVisible)
+            if (!win.modalVisible)
                 win.helpVisible = !win.helpVisible;
         }
     }
@@ -275,8 +323,12 @@ ApplicationWindow {
         onActivated: {
             if (win.quitConfirmVisible)
                 win.quitConfirmVisible = false;
+            else if (win.uploadVisible)
+                win.uploadVisible = false;
             else if (win.helpVisible)
                 win.helpVisible = false;
+            else if (backend.uploading)
+                backend.cancelUpload();
         }
     }
 
@@ -444,6 +496,22 @@ ApplicationWindow {
                     ctx.moveTo(6, 20);
                     ctx.lineTo(18, 20);
                     ctx.stroke();
+                } else if (iconButton.iconName === "upload") {
+                    ctx.beginPath();
+                    ctx.moveTo(12, 15);
+                    ctx.lineTo(12, 5);
+                    ctx.stroke();
+
+                    ctx.beginPath();
+                    ctx.moveTo(7, 9);
+                    ctx.lineTo(12, 4);
+                    ctx.lineTo(17, 9);
+                    ctx.stroke();
+
+                    ctx.beginPath();
+                    ctx.moveTo(6, 20);
+                    ctx.lineTo(18, 20);
+                    ctx.stroke();
                 }
             }
 
@@ -550,6 +618,15 @@ ApplicationWindow {
                 enabled: backend.duration > 0 && !backend.busy
                 onClicked: exportVideo()
             }
+
+            IconButton {
+                Layout.preferredWidth: 44
+                Layout.preferredHeight: 44
+                iconName: "upload"
+                tipText: "Upload and copy the link"
+                enabled: backend.duration > 0 && !backend.busy
+                onClicked: showUpload()
+            }
         }
 
         // --- status line ---
@@ -652,6 +729,7 @@ ApplicationWindow {
                         { keys: "Z", action: "Zoom the selection" },
                         { keys: "Ctrl O", action: "Open a video" },
                         { keys: "Ctrl S", action: "Export" },
+                        { keys: "Ctrl U", action: "Upload and copy the link" },
                         { keys: "Q", action: "Quit" },
                         { keys: "?", action: "Show these shortcuts" }
                     ]
@@ -761,6 +839,172 @@ ApplicationWindow {
         }
     }
 
+    // --- upload dialog ---
+    Rectangle {
+        visible: win.uploadVisible
+        anchors.fill: parent
+        color: "#000000cc"
+        onVisibleChanged: {
+            if (visible)
+                uploadKeys.forceActiveFocus();
+        }
+
+        MouseArea {
+            anchors.fill: parent
+            onClicked: win.uploadVisible = false
+        }
+
+        Rectangle {
+            anchors.centerIn: parent
+            width: uploadColumn.width + 56
+            height: uploadColumn.height + 48
+            radius: 12
+            color: "#1c1c1e"
+
+            MouseArea {
+                anchors.fill: parent
+            }
+
+            // Up/Down pick the host, Left/Right the quality, Enter uploads.
+            Item {
+                id: uploadKeys
+                objectName: "uploadKeys"
+                Keys.onUpPressed: stepUploadDestination(-1)
+                Keys.onDownPressed: stepUploadDestination(1)
+                Keys.onLeftPressed: stepUploadHeight(-1)
+                Keys.onRightPressed: stepUploadHeight(1)
+                Keys.onReturnPressed: uploadVideo()
+                Keys.onEnterPressed: uploadVideo()
+            }
+
+            Column {
+                id: uploadColumn
+                anchors.centerIn: parent
+                width: 360
+                spacing: 8
+
+                Label {
+                    text: "Upload trim"
+                    color: "white"
+                    font.pixelSize: 16
+                    font.weight: Font.DemiBold
+                }
+
+                Label {
+                    width: parent.width
+                    text: "The link is copied to your clipboard when it's done."
+                    color: "#d6d6da"
+                    font.pixelSize: 13
+                    wrapMode: Text.WordWrap
+                    bottomPadding: 6
+                }
+
+                Repeater {
+                    model: backend.uploadDestinations
+                    delegate: Rectangle {
+                        required property int index
+                        required property string modelData
+                        readonly property bool selected: index === backend.uploadDestination
+                        width: uploadColumn.width
+                        height: 34
+                        radius: 8
+                        color: selected ? "#2c2c2f" : (destinationHover.hovered ? "#242427" : "transparent")
+                        border.color: selected ? win.accent : "transparent"
+                        border.width: selected ? 2 : 0
+
+                        Label {
+                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.leftMargin: 12
+                            anchors.rightMargin: 12
+                            text: modelData
+                            color: "white"
+                            font.pixelSize: 13
+                            elide: Text.ElideRight
+                        }
+                        HoverHandler {
+                            id: destinationHover
+                            cursorShape: Qt.PointingHandCursor
+                        }
+                        TapHandler {
+                            onTapped: backend.uploadDestination = index
+                            onDoubleTapped: {
+                                backend.uploadDestination = index;
+                                uploadVideo();
+                            }
+                        }
+                    }
+                }
+
+                Row {
+                    visible: win.uploadHeightChoices.length > 1
+                    spacing: 6
+                    topPadding: 6
+
+                    Label {
+                        width: 64
+                        height: 28
+                        text: "Quality"
+                        color: "#b8b8bc"
+                        font.pixelSize: 13
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    Repeater {
+                        model: win.uploadHeightChoices
+                        delegate: Rectangle {
+                            required property int modelData
+                            readonly property bool selected: modelData === win.uploadHeight
+                            width: qualityLabel.implicitWidth + 20
+                            height: 28
+                            radius: 14
+                            color: selected ? win.accent : "#2c2c2f"
+
+                            Label {
+                                id: qualityLabel
+                                anchors.centerIn: parent
+                                text: heightLabel(modelData)
+                                color: parent.selected ? win.accentForeground : "white"
+                                font.pixelSize: 12
+                                font.weight: Font.DemiBold
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: win.uploadHeight = modelData
+                            }
+                        }
+                    }
+                }
+
+                Label {
+                    width: parent.width
+                    topPadding: 6
+                    text: "Add hosts as ShareX .sxcu files in " + backend.uploadDestinationsDir
+                    color: "#7a7a80"
+                    font.pixelSize: 11
+                    wrapMode: Text.WrapAnywhere
+                    bottomPadding: 12
+                }
+
+                Row {
+                    anchors.right: parent.right
+                    spacing: 10
+
+                    DialogButton {
+                        text: "Cancel"
+                        onClicked: win.uploadVisible = false
+                    }
+                    DialogButton {
+                        text: "Upload"
+                        primary: true
+                        onClicked: uploadVideo()
+                    }
+                }
+            }
+        }
+    }
+
     Connections {
         target: backend
         function onInfoChanged() {
@@ -785,6 +1029,15 @@ ApplicationWindow {
         }
         function onExportFailed(message) {
             win.showNotice("Export failed: " + message);
+        }
+        // An upload shares the trim, so it no longer needs guarding on quit.
+        function onUploadDone(url, deletionUrl) {
+            win.exportedStartSec = win.pendingExportStartSec;
+            win.exportedEndSec = win.pendingExportEndSec;
+            win.showNotice("Link copied: " + url);
+        }
+        function onUploadFailed(message) {
+            win.showNotice("Upload failed: " + message);
         }
         function onLoadError(message) {
             win.showNotice("Cannot open video: " + message);

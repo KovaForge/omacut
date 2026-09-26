@@ -456,7 +456,9 @@ void Backend::encodeClip(const QString &outPath, double start, double end, int s
 }
 
 QString Backend::uploadDestinationsDir() const {
-    return uploads::userDestinationsDir();
+    const QString dir = uploads::userDestinationsDir();
+    const QString home = QDir::homePath();
+    return dir.startsWith(home + QLatin1Char('/')) ? QLatin1Char('~') + dir.mid(home.size()) : dir;
 }
 
 QString Backend::uploadHistoryPath() {

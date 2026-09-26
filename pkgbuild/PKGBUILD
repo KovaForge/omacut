@@ -9,6 +9,7 @@ url='https://github.com/omacom-io/omacut'
 license=('MIT')
 install='omacut.install'
 depends=('ffmpeg' 'qt6-base' 'qt6-declarative' 'qt6-multimedia' 'xdg-desktop-portal')
+optdepends=('wl-clipboard: keep uploaded links on the clipboard after omacut quits')
 makedepends=('gcc' 'make' 'qt6-base' 'qt6-declarative' 'qt6-multimedia')
 source=()
 sha256sums=()

@@ -75,6 +75,10 @@ class ShortcutBackend : public QObject {
     Q_PROPERTY(QString status READ status NOTIFY statusChanged)
     Q_PROPERTY(QString themeAccent READ themeAccent NOTIFY themeAccentChanged)
     Q_PROPERTY(QString themeAccentForeground READ themeAccentForeground NOTIFY themeAccentChanged)
+    Q_PROPERTY(QStringList uploadDestinations READ uploadDestinations CONSTANT)
+    Q_PROPERTY(int uploadDestination MEMBER uploadDestination NOTIFY uploadDestinationChanged)
+    Q_PROPERTY(QString uploadDestinationsDir READ uploadDestinationsDir CONSTANT)
+    Q_PROPERTY(bool uploading READ uploading CONSTANT)
 
 public:
     explicit ShortcutBackend(QUrl source, double duration, QObject *parent = nullptr)
@@ -89,6 +93,11 @@ public:
     QString status() const { return {}; }
     QString themeAccent() const { return QStringLiteral("#FFD60A"); }
     QString themeAccentForeground() const { return QStringLiteral("black"); }
+    QStringList uploadDestinations() const {
+        return {QStringLiteral("First host"), QStringLiteral("Second host")};
+    }
+    QString uploadDestinationsDir() const { return QStringLiteral("~/.config/omacut/uploaders"); }
+    bool uploading() const { return false; }
 
     Q_INVOKABLE bool load(const QUrl &) { return false; }
     Q_INVOKABLE void openVideoDialog() { ++openCount; }
@@ -107,6 +116,24 @@ public:
 
     void announceInfo() { emit infoChanged(); }
     void announceExportDone() { emit exportDone(QStringLiteral("/tmp/exported.mp4")); }
+    void announceUploadDone() { emit uploadDone(QStringLiteral("https://h.example/a.mp4"), {}); }
+
+    Q_INVOKABLE void reloadUploadDestinations() { ++reloadCount; }
+    Q_INVOKABLE QList<int> uploadHeights() const { return {1080, 720}; }
+    Q_INVOKABLE void uploadClip(double start, double end, int scaleHeight) {
+        ++uploadCount;
+        lastStart = start;
+        lastEnd = end;
+        lastUploadHeight = scaleHeight;
+        lastUploadDestination = uploadDestination;
+    }
+    Q_INVOKABLE void cancelUpload() {}
+
+    int uploadDestination = 0;
+    int reloadCount = 0;
+    int uploadCount = 0;
+    int lastUploadHeight = -1;
+    int lastUploadDestination = -1;
 
     int openCount = 0;
     int exportCount = 0;
@@ -125,17 +152,22 @@ signals:
     void exportDone(const QString &path);
     void exportFailed(const QString &message);
     void loadError(const QString &message);
+    void uploadDestinationChanged();
+    void uploadDone(const QString &url, const QString &deletionUrl);
+    void uploadFailed(const QString &message);
 
 private:
     QUrl m_source;
     double m_duration;
 };
 
-// Finds a DialogButton by its label ("primary" tells them apart from Labels).
+// Finds a shown DialogButton by its label ("primary" tells them apart from
+// Labels, and several dialogs share labels like "Cancel").
 static QQuickItem *dialogButton(QQuickWindow *window, const QString &text) {
     const auto items = window->findChildren<QQuickItem *>();
     for (QQuickItem *item : items) {
-        if (item->property("primary").isValid() && item->property("text").toString() == text)
+        if (item->isVisible() && item->property("primary").isValid()
+                && item->property("text").toString() == text)
             return item;
     }
     return nullptr;
@@ -198,6 +230,7 @@ private slots:
     void qmlSpaceChordsSetTheTrimEdges();
     void qmlZoomFocusesTheSelection();
     void qmlQuitConfirmsUnexportedTrim();
+    void qmlUploadDialogPicksHostAndQuality();
     void trimArgsReencodeForPreciseCuts();
     void trimArgsScaleTheShorterSide();
     void exportHeightsNeverUpscale();
@@ -873,6 +906,69 @@ void BackendTests::qmlQuitConfirmsUnexportedTrim() {
     QTest::keyClick(window, Qt::Key_Return);
     QTRY_VERIFY_WITH_TIMEOUT(!window->isVisible(), 3000);
     QCOMPARE(quitSpy.count(), 1);
+}
+
+void BackendTests::qmlUploadDialogPicksHostAndQuality() {
+    ShortcutBackend backend(QUrl::fromLocalFile(m_dir.filePath(QStringLiteral("shortcut-placeholder.mp4"))),
+                            20.0);
+    QmlHarness harness(backend);
+
+    QVERIFY2(harness.window(), qPrintable(mainQmlPath()));
+    QQuickWindow *window = harness.window();
+    QTRY_VERIFY_WITH_TIMEOUT(window->property("audioOutputReady").toBool(), 3000);
+
+    backend.announceInfo();
+    QQuickItem *trimBar = harness.trimBar();
+    QVERIFY(trimBar);
+
+    window->show();
+    window->requestActivate();
+    QTest::qWait(100);
+
+    QTest::keyClick(window, Qt::Key_Right, Qt::ShiftModifier);
+    QTest::keyClick(window, Qt::Key_Space, Qt::ControlModifier);
+    QTRY_COMPARE_WITH_TIMEOUT(trimBar->property("startSec").toDouble(), 5.0, 3000);
+
+    // Ctrl+U opens the dialog with a fresh look at the hosts.
+    QTest::keyClick(window, Qt::Key_U, Qt::ControlModifier);
+    QTRY_COMPARE_WITH_TIMEOUT(window->property("uploadVisible").toBool(), true, 3000);
+    QCOMPARE(backend.reloadCount, 1);
+
+    // Escape backs out without uploading.
+    QTest::keyClick(window, Qt::Key_Escape);
+    QTRY_COMPARE_WITH_TIMEOUT(window->property("uploadVisible").toBool(), false, 3000);
+    QCOMPARE(backend.uploadCount, 0);
+
+    // Arrows pick the host and quality instead of seeking; Enter uploads.
+    QTest::keyClick(window, Qt::Key_U, Qt::ControlModifier);
+    QTRY_COMPARE_WITH_TIMEOUT(window->property("uploadVisible").toBool(), true, 3000);
+    QTest::keyClick(window, Qt::Key_Down);
+    QTRY_COMPARE_WITH_TIMEOUT(backend.uploadDestination, 1, 3000);
+    QTest::keyClick(window, Qt::Key_Right);
+    QTest::keyClick(window, Qt::Key_Return);
+    QTRY_COMPARE_WITH_TIMEOUT(backend.uploadCount, 1, 3000);
+    QCOMPARE(window->property("uploadVisible").toBool(), false);
+    QCOMPARE(backend.lastUploadDestination, 1);
+    QCOMPARE(backend.lastUploadHeight, 1080);
+    QCOMPARE(backend.lastStart, 5.0);
+    QCOMPARE(backend.lastEnd, 20.0);
+    QCOMPARE(trimBar->property("playheadSec").toDouble(), 5.0);
+
+    // Down wraps back to the first host; the Upload button works too.
+    QTest::keyClick(window, Qt::Key_U, Qt::ControlModifier);
+    QTRY_COMPARE_WITH_TIMEOUT(window->property("uploadVisible").toBool(), true, 3000);
+    QTest::keyClick(window, Qt::Key_Down);
+    QTRY_COMPARE_WITH_TIMEOUT(backend.uploadDestination, 0, 3000);
+    QQuickItem *uploadButton = dialogButton(window, QStringLiteral("Upload"));
+    QVERIFY(uploadButton);
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, itemCenter(uploadButton));
+    QTRY_COMPARE_WITH_TIMEOUT(backend.uploadCount, 2, 3000);
+    QCOMPARE(backend.lastUploadDestination, 0);
+
+    // A finished upload counts as shared, so quitting doesn't ask.
+    QTRY_COMPARE_WITH_TIMEOUT(window->property("trimDirty").toBool(), true, 3000);
+    backend.announceUploadDone();
+    QTRY_COMPARE_WITH_TIMEOUT(window->property("trimDirty").toBool(), false, 3000);
 }
 
 void BackendTests::trimArgsReencodeForPreciseCuts() {

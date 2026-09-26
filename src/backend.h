@@ -59,6 +59,7 @@ public:
     QStringList uploadDestinations() const { return m_uploadDestinationNames; }
     int uploadDestination() const { return m_uploadDestination; }
     void setUploadDestination(int index);
+    // Where user .sxcu files go, with the home directory shown as ~.
     QString uploadDestinationsDir() const;
     bool uploading() const { return m_uploading; }
 

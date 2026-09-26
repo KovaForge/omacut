@@ -17,6 +17,7 @@ Built using **Qt Quick (QML)** UI with the Material style — the same Qt stack 
 - *Z*: Zoom into the trimmed selection for fine tuning (Z again zooms back out).
 - *Ctrl+O*: Open a new file to trim.
 - *Ctrl+S*: Export the current trim.
+- *Ctrl+U*: Upload the current trim and copy its link (Escape cancels a running upload).
 - *Q*: Quit (asks first if the trim hasn't been exported).
 - *?*: Show the hotkeys in the app.
 
@@ -31,6 +32,28 @@ Install via the Omarchy Package Repository via the `omacut` package. It's instal
 
 Exports are always written as MP4 files, regardless of the input video's container. The export dialog offers Original/1080p/720p quality — never upscaling, and always preserving the aspect ratio.
 
+## Upload
+
+*Ctrl+U* (or the upload button) encodes the trim just like an export and sends it to a file host. Pick the host and quality with the arrow keys, press Enter, and the link lands on your clipboard when it's done. Built in are three anonymous hosts, no account needed:
+
+- **Litterbox**: deleted after 72 hours, up to 1 GB (the default)
+- **Catbox**: kept, up to 200 MB
+- **Uguu**: deleted after 3 hours, up to 128 MiB
+
+Add your own hosts as ShareX custom uploader (`.sxcu`) files in `~/.config/omacut/uploaders/`, so configs from ShareX or XerahS work unchanged. Destinations with a multipart body (`FileFormName`) or a `Binary` body are supported, and responses are read with the `{response}`, `{json:path}`, `{regex:pattern|group}`, `{header:name}` and `{filename}` syntax. For example, `0x0.st.sxcu`:
+
+```json
+{
+  "Name": "0x0.st",
+  "RequestURL": "https://0x0.st",
+  "Body": "MultipartFormData",
+  "FileFormName": "file",
+  "DeletionURL": "{header:X-Token}"
+}
+```
+
+The last host you picked is remembered. Every upload is also appended to `~/.local/state/omacut/uploads.jsonl`, deletion links included. On Wayland the link is copied with `wl-copy` when it's installed, so it stays on the clipboard after omacut quits.
+
 ## Build
 
 Uses Qt's own build tool, `qmake6` (no cmake needed):
@@ -43,8 +66,8 @@ This produces a single `omacut` binary in `build/`.
 
 Requirements:
 
-- A C++17 compiler and Qt6: `qt6-base`, `qt6-declarative` (Qt Quick + Controls),
-  `qt6-multimedia`
+- A C++17 compiler and Qt6: `qt6-base` (including Qt Network), `qt6-declarative`
+  (Qt Quick + Controls), `qt6-multimedia`
 
 ## Test
 
