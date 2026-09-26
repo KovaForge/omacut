@@ -1,6 +1,9 @@
 #pragma once
 
 #include <QByteArray>
+#include <QDateTime>
+#include <QList>
+#include <QPair>
 #include <QHash>
 #include <QNetworkRequest>
 #include <QPointer>
@@ -33,6 +36,21 @@ struct Reply {
 // A single line of a response body, for error messages.
 QString snippet(const QByteArray &body, int length = 200);
 bool isWebLink(const QString &text);
+
+// "cloud.example.com/" -> "https://cloud.example.com": a scheme when missing,
+// no trailing slash, query or fragment.
+QString normalizeServerUrl(const QString &url);
+// %y, %mo, %d, %h, %mi and %s become the year, month, day, hour, minute and
+// second of now.
+QString expandDateTokens(QString text, const QDateTime &now);
+// "clip_trimmed.mp4" -> "clip_trimmed-k3x9qa.mp4", so repeat uploads of a
+// same-named trim never overwrite each other.
+QString taggedFileName(const QString &fileName);
+QString mimeTypeFor(const QString &path);
+
+// A multipart/form-data body: fields first, then the file (taken over).
+QHttpMultiPart *formData(const QList<QPair<QString, QString>> &fields, const QString &fileField,
+                         const QString &fileName, QIODevice *file, const QString &mimeType);
 
 // A job made of HTTP requests run one after another. Subclasses chain them
 // with send(), and end with succeed() or fail(); cancelling, stalls and the

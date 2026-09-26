@@ -1,5 +1,6 @@
 #include "hosts.h"
 
+#include <QDesktopServices>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -30,7 +31,8 @@ const Field *findField(const QList<Field> &fields, const QString &key) {
 }
 
 Hosts::Hosts(const QString &configDir, std::unique_ptr<SecretStore> secrets, QObject *parent)
-    : QObject(parent), m_configDir(configDir), m_secrets(std::move(secrets)) {
+    : QObject(parent), m_configDir(configDir), m_secrets(std::move(secrets)),
+      m_openUrl([](const QUrl &url) { return QDesktopServices::openUrl(url); }) {
     reload();
 }
 
@@ -202,14 +204,19 @@ QString Hosts::save(const QString &id, const QString &providerId, const QString 
     }
     const QString hostId = existing ? id : QUuid::createUuid().toString(QUuid::WithoutBraces);
 
-    // Only the provider's own fields are kept; blank secrets keep what's stored.
+    // Only the provider's own fields are kept; blank secrets keep what's
+    // stored. A sign-in done in this form fills in what it returned.
     Host host{hostId, providerId, trimmedName, existing ? existing->settings : QVariantMap(), false};
     QVariantMap secrets;
     QVariantMap check = existing ? resolvedSettings(*existing) : QVariantMap();
+    const QVariantMap pending = m_pendingProvider == providerId ? m_pending : QVariantMap();
     for (const Field &field : provider->fields()) {
-        if (field.hidden || !values.contains(field.key))
+        const bool fromSignIn = pending.contains(field.key)
+            && (field.hidden || field.type == Field::Secret
+                || values.value(field.key).toString().isEmpty());
+        if (!fromSignIn && (field.hidden || !values.contains(field.key)))
             continue;
-        const QVariant value = values.value(field.key);
+        const QVariant value = fromSignIn ? pending.value(field.key) : values.value(field.key);
         if (field.type == Field::Secret) {
             if (!value.toString().isEmpty()) {
                 secrets.insert(field.key, value);
@@ -248,6 +255,7 @@ QString Hosts::save(const QString &id, const QString &providerId, const QString 
             --at;
         m_hosts.insert(at, host);
     }
+    discardAuthorization();
     persist();
     emit changed();
     return hostId;
@@ -325,6 +333,7 @@ Services Hosts::servicesFor(const QString &id) {
     services.createJob = [this](const QString &hostId, QObject *parent) {
         return createJob(hostId, parent);
     };
+    services.openUrl = m_openUrl;
     return services;
 }
 
@@ -345,16 +354,22 @@ Job *Hosts::createJob(const QString &id, QObject *parent) {
     return provider->createJob(settings, servicesFor(id), parent);
 }
 
-void Hosts::authorize(const QString &id) {
+void Hosts::authorize(const QString &id, const QString &providerId, const QVariantMap &values) {
     if (m_authorization)
         return;
-    const Host *host = find(id);
-    const Provider *provider = host ? findProvider(host->provider) : nullptr;
-    Authorization *authorization = provider
-        ? provider->authorize(resolvedSettings(*host), servicesFor(id), this)
-        : nullptr;
+    const Provider *provider = findProvider(providerId);
+    const Host *host = id.isEmpty() ? nullptr : find(id);
+    QVariantMap settings = host && host->provider == providerId ? resolvedSettings(*host)
+                                                                 : QVariantMap();
+    for (auto it = values.begin(); it != values.end(); ++it) {
+        if (!it.value().toString().isEmpty() || it.value().typeId() == QMetaType::Bool)
+            settings.insert(it.key(), it.value());
+    }
+    Authorization *authorization =
+        provider ? provider->authorize(provider->withDefaults(settings), servicesFor(id), this)
+                 : nullptr;
     if (!authorization) {
-        emit authorizeFinished(id, QStringLiteral("This host doesn't sign in."), QString());
+        emit authorizeFinished(QStringLiteral("This host doesn't sign in."), {}, {});
         return;
     }
 
@@ -366,17 +381,35 @@ void Hosts::authorize(const QString &id) {
     };
     connect(authorization, &Authorization::status, this, &Hosts::authorizeStatus);
     connect(authorization, &Authorization::finished, this,
-            [this, id, done](const QVariantMap &changes, const QString &summary) {
-                storeChanges(id, changes);
+            [this, provider, done](const QVariantMap &changes, const QString &summary) {
+                m_pendingProvider = provider->id();
+                m_pending = changes;
+                // The form shows what it can; secrets only as "stored".
+                QVariantMap formValues;
+                QStringList secretsSet;
+                for (const Field &field : provider->fields()) {
+                    if (!changes.contains(field.key) || field.hidden)
+                        continue;
+                    if (field.type == Field::Secret)
+                        secretsSet << field.key;
+                    else
+                        formValues.insert(field.key, changes.value(field.key));
+                }
+                formValues.insert(QStringLiteral("secretsSet"), secretsSet);
                 done();
-                emit authorizeFinished(id, QString(), summary);
+                emit authorizeFinished(QString(), summary, formValues);
             });
-    connect(authorization, &Authorization::failed, this, [this, id, done](const QString &error) {
+    connect(authorization, &Authorization::failed, this, [this, done](const QString &error) {
         done();
-        emit authorizeFinished(id, error, QString());
+        emit authorizeFinished(error, QString(), {});
     });
     emit authorizingChanged();
     authorization->start();
+}
+
+void Hosts::discardAuthorization() {
+    m_pendingProvider.clear();
+    m_pending.clear();
 }
 
 void Hosts::cancelAuthorize() {

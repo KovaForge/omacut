@@ -3,6 +3,8 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QHttpMultiPart>
+#include <QMimeDatabase>
+#include <QRandomGenerator>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 
@@ -17,6 +19,79 @@ QString snippet(const QByteArray &body, int length) {
     if (text.size() > length)
         text = text.left(length) + QStringLiteral("…");
     return text;
+}
+
+QString normalizeServerUrl(const QString &url) {
+    QString text = url.trimmed();
+    if (text.isEmpty())
+        return {};
+    if (!text.contains(QStringLiteral("://")))
+        text.prepend(QStringLiteral("https://"));
+    QUrl parsed(text);
+    parsed.setQuery(QString());
+    parsed.setFragment(QString());
+    QString out = parsed.toString();
+    while (out.endsWith(QLatin1Char('/')))
+        out.chop(1);
+    return out;
+}
+
+QString expandDateTokens(QString text, const QDateTime &now) {
+    const QList<QPair<QString, QString>> tokens = {
+        {QStringLiteral("%mo"), now.toString(QStringLiteral("MM"))},
+        {QStringLiteral("%mi"), now.toString(QStringLiteral("mm"))},
+        {QStringLiteral("%y"), now.toString(QStringLiteral("yyyy"))},
+        {QStringLiteral("%d"), now.toString(QStringLiteral("dd"))},
+        {QStringLiteral("%h"), now.toString(QStringLiteral("HH"))},
+        {QStringLiteral("%s"), now.toString(QStringLiteral("ss"))},
+    };
+    for (const auto &[token, value] : tokens)
+        text.replace(token, value);
+    return text;
+}
+
+QString taggedFileName(const QString &fileName) {
+    static const char alphabet[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+    QString tag;
+    for (int i = 0; i < 6; ++i)
+        tag += QLatin1Char(alphabet[QRandomGenerator::global()->bounded(36)]);
+    const QFileInfo info(fileName);
+    const QString suffix = info.completeSuffix();
+    return info.baseName() + QLatin1Char('-') + tag
+        + (suffix.isEmpty() ? QString() : QLatin1Char('.') + suffix);
+}
+
+QString mimeTypeFor(const QString &path) {
+    return QMimeDatabase().mimeTypeForFile(path).name();
+}
+
+namespace {
+QByteArray quoted(const QString &value) {
+    QByteArray bytes = value.toUtf8();
+    bytes.replace('\\', "\\\\").replace('"', "\\\"");
+    return '"' + bytes + '"';
+}
+}
+
+QHttpMultiPart *formData(const QList<QPair<QString, QString>> &fields, const QString &fileField,
+                         const QString &fileName, QIODevice *file, const QString &mimeType) {
+    auto *multipart = new QHttpMultiPart(QHttpMultiPart::FormDataType);
+    for (const auto &[key, value] : fields) {
+        QHttpPart part;
+        part.setHeader(QNetworkRequest::ContentDispositionHeader,
+                       QByteArray("form-data; name=") + quoted(key));
+        part.setBody(value.toUtf8());
+        multipart->append(part);
+    }
+    QHttpPart filePart;
+    filePart.setHeader(QNetworkRequest::ContentDispositionHeader,
+                       QByteArray("form-data; name=") + quoted(fileField) + "; filename="
+                           + quoted(fileName));
+    filePart.setHeader(QNetworkRequest::ContentTypeHeader, mimeType);
+    filePart.setBodyDevice(file);
+    file->setParent(multipart);
+    multipart->append(filePart);
+    return multipart;
 }
 
 bool isWebLink(const QString &text) {

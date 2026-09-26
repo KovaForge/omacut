@@ -71,5 +71,6 @@ inline upload::Services testServices(QNetworkAccessManager *network) {
     services.network = network;
     services.saveSettings = [](const QVariantMap &) {};
     services.createJob = [](const QString &, QObject *) -> upload::Job * { return nullptr; };
+    services.openUrl = [](const QUrl &) { return true; };
     return services;
 }

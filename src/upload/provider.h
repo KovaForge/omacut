@@ -4,6 +4,7 @@
 #include <QObject>
 #include <QString>
 #include <QStringList>
+#include <QUrl>
 #include <QVariant>
 #include <QVariantMap>
 
@@ -61,6 +62,8 @@ struct Services {
     std::function<void(const QVariantMap &changes)> saveSettings;
     // Makes a job for another configured host, for providers that delegate.
     std::function<Job *(const QString &hostId, QObject *parent)> createJob;
+    // Opens a sign-in page in the browser.
+    std::function<bool(const QUrl &url)> openUrl;
 };
 
 // One upload. start() leads to exactly one of finished or failed, and cancel()

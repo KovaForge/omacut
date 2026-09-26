@@ -1,7 +1,9 @@
 #include <QtTest>
 
 #include <QCryptographicHash>
+#include <QJsonArray>
 #include <QRegularExpression>
+#include <QUrlQuery>
 #include <QTemporaryDir>
 
 #include "fakehttpserver.h"
@@ -46,6 +48,14 @@ private slots:
     void s3ReportsItsErrorMessage();
     void s3BuildsSignedAndCustomDomainLinks();
     void hostsKeepSecretsInTheSecretStore();
+    void nextcloudMakesFoldersUploadsAndShares();
+    void nextcloudReportsBadCredentials();
+    void nextcloudSignInFillsTheFormAndSaves();
+    void immichUploadsAndSharesTheAsset();
+    void immichCanLinkToTheAssetInstead();
+    void xbackboneUploadsWithEitherApi();
+    void imgurUploadsVideosAnonymously();
+    void everyProviderDescribesItsFields();
 
 private:
     QString writeClip(qint64 size = 0);
@@ -353,6 +363,267 @@ void ProviderTests::hostsKeepSecretsInTheSecretStore() {
 
     hosts.remove(id);
     QVERIFY(secrets->read(id + QStringLiteral("/secretAccessKey")).isEmpty());
+}
+
+void ProviderTests::nextcloudMakesFoldersUploadsAndShares() {
+    FakeHttpServer server;
+    QVERIFY(server.listen());
+    server.responder = [&server](const FakeHttpServer::Request &request) -> FakeHttpServer::Response {
+        if (request.method == "MKCOL")
+            return {request.target.endsWith("/omacut") ? 405 : 201, {}, {}};
+        if (request.method == "PUT")
+            return {201, {}, {}};
+        return {200, R"({"ocs":{"meta":{"statuscode":200},"data":{"url":")"
+                         + server.url(QStringLiteral("/s/AbC123")).toLatin1() + R"("}}})", {}};
+    };
+
+    const QVariantMap settings{
+        {QStringLiteral("name"), QStringLiteral("Cloud")},
+        {QStringLiteral("serverUrl"), server.url(QStringLiteral("/"))},
+        {QStringLiteral("username"), QStringLiteral("al ice")},
+        {QStringLiteral("appPassword"), QStringLiteral("app-pw")},
+        {QStringLiteral("folder"), QStringLiteral("/omacut/%y")},
+        {QStringLiteral("expireDays"), 3},
+        {QStringLiteral("directLink"), true},
+    };
+    const UploadOutcome outcome =
+        runJob(nextcloudProvider()->createJob(settings, testServices(&m_network), nullptr), writeClip());
+    QVERIFY2(outcome.ok, qPrintable(outcome.error));
+    QCOMPARE(outcome.url, server.url(QStringLiteral("/s/AbC123/download")));
+
+    const QString year = QDate::currentDate().toString(QStringLiteral("yyyy"));
+    QCOMPARE(server.requests.size(), 4);
+    // An existing folder (405) is fine; each level is made in turn.
+    QCOMPARE(server.requests.at(0).method, QByteArray("MKCOL"));
+    QCOMPARE(server.requests.at(0).target, QByteArray("/remote.php/dav/files/al%20ice/omacut"));
+    QCOMPARE(server.requests.at(1).target,
+             QStringLiteral("/remote.php/dav/files/al%20ice/omacut/%1").arg(year).toLatin1());
+    const FakeHttpServer::Request &put = server.requests.at(2);
+    QCOMPARE(put.method, QByteArray("PUT"));
+    QVERIFY(QRegularExpression(QStringLiteral("^/remote.php/dav/files/al%20ice/omacut/\\d{4}/clip_trimmed-[a-z0-9]{6}\\.mp4$"))
+                .match(QString::fromLatin1(put.target)).hasMatch());
+    QCOMPARE(put.headers.value("authorization"), "Basic " + QByteArray("al ice:app-pw").toBase64());
+    QCOMPARE(put.body, QByteArray("fake mp4 bytes"));
+
+    const FakeHttpServer::Request &share = server.requests.at(3);
+    QCOMPARE(share.target, QByteArray("/ocs/v2.php/apps/files_sharing/api/v1/shares?format=json"));
+    QCOMPARE(share.headers.value("ocs-apirequest"), QByteArray("true"));
+    const QUrlQuery form(QString::fromUtf8(share.body));
+    QCOMPARE(form.queryItemValue(QStringLiteral("shareType")), QStringLiteral("3"));
+    QVERIFY(form.queryItemValue(QStringLiteral("path"), QUrl::FullyDecoded)
+                .startsWith(QStringLiteral("/omacut/%1/clip_trimmed-").arg(year)));
+    QCOMPARE(form.queryItemValue(QStringLiteral("expireDate")),
+             QDate::currentDate().addDays(3).toString(Qt::ISODate));
+}
+
+void ProviderTests::nextcloudReportsBadCredentials() {
+    FakeHttpServer server;
+    QVERIFY(server.listen());
+    server.status = 401;
+    const QVariantMap settings{
+        {QStringLiteral("name"), QStringLiteral("Cloud")},
+        {QStringLiteral("serverUrl"), server.url(QString())},
+        {QStringLiteral("username"), QStringLiteral("a")},
+        {QStringLiteral("appPassword"), QStringLiteral("wrong")},
+        {QStringLiteral("folder"), QStringLiteral("x")},
+    };
+    const UploadOutcome outcome =
+        runJob(nextcloudProvider()->createJob(settings, testServices(&m_network), nullptr), writeClip());
+    QCOMPARE(outcome.error, QStringLiteral("Cloud answered HTTP 401: check the user name and app password"));
+}
+
+void ProviderTests::nextcloudSignInFillsTheFormAndSaves() {
+    FakeHttpServer server;
+    QVERIFY(server.listen());
+    server.responder = [&server](const FakeHttpServer::Request &request) -> FakeHttpServer::Response {
+        if (request.target == "/index.php/login/v2") {
+            return {200, R"({"poll":{"token":"tok","endpoint":")"
+                             + server.url(QStringLiteral("/login/v2/poll")).toLatin1()
+                             + R"("},"login":")" + server.url(QStringLiteral("/login/v2/flow/x")).toLatin1()
+                             + R"("})", {}};
+        }
+        return {200, R"({"server":")" + server.url(QString()).toLatin1()
+                         + R"(","loginName":"alice","appPassword":"granted"})", {}};
+    };
+
+    QTemporaryDir config;
+    auto store = std::make_unique<MemorySecretStore>();
+    MemorySecretStore *secrets = store.get();
+    Hosts hosts(config.path(), std::move(store));
+    hosts.setNetwork(&m_network);
+    QList<QUrl> opened;
+    hosts.setUrlOpener([&opened](const QUrl &url) {
+        opened << url;
+        return true;
+    });
+
+    QSignalSpy finished(&hosts, &Hosts::authorizeFinished);
+    const QVariantMap draft{{QStringLiteral("serverUrl"), server.url(QString())}};
+    hosts.authorize({}, QStringLiteral("nextcloud"), draft);
+    QVERIFY(hosts.authorizing());
+    QTRY_COMPARE(finished.count(), 1);
+    QVERIFY(!hosts.authorizing());
+    QCOMPARE(finished.first().at(0).toString(), QString());
+    QCOMPARE(finished.first().at(1).toString(), QStringLiteral("Signed in as alice"));
+    const QVariantMap formValues = finished.first().at(2).toMap();
+    QCOMPARE(formValues.value(QStringLiteral("username")).toString(), QStringLiteral("alice"));
+    QVERIFY(!formValues.contains(QStringLiteral("appPassword")));
+    QCOMPARE(formValues.value(QStringLiteral("secretsSet")).toStringList(),
+             QStringList{QStringLiteral("appPassword")});
+    QCOMPARE(opened, QList<QUrl>{QUrl(server.url(QStringLiteral("/login/v2/flow/x")))});
+    QCOMPARE(server.requests.at(1).body, QByteArray("token=tok"));
+
+    // The app password was never typed; saving the form stores it anyway.
+    QVariantMap values = draft;
+    values.insert(QStringLiteral("username"), QStringLiteral("alice"));
+    const QString id = hosts.save({}, QStringLiteral("nextcloud"), QStringLiteral("Cloud"), values);
+    QVERIFY2(!id.isEmpty(), qPrintable(hosts.lastError()));
+    QCOMPARE(secrets->read(id + QStringLiteral("/appPassword")), QStringLiteral("granted"));
+
+    // Used once: another host of the same kind doesn't inherit it.
+    values.insert(QStringLiteral("username"), QStringLiteral("bob"));
+    QVERIFY(hosts.save({}, QStringLiteral("nextcloud"), QStringLiteral("Other"), values).isEmpty());
+    QCOMPARE(hosts.lastError(), QStringLiteral("App password is required."));
+}
+
+void ProviderTests::immichUploadsAndSharesTheAsset() {
+    FakeHttpServer server;
+    QVERIFY(server.listen());
+    server.responder = [](const FakeHttpServer::Request &request) -> FakeHttpServer::Response {
+        if (request.target == "/api/assets")
+            return {201, R"({"id":"asset-1","status":"created"})", {}};
+        return {201, R"({"id":"link-1","key":"KEY","slug":null})", {}};
+    };
+
+    const QVariantMap settings{
+        {QStringLiteral("name"), QStringLiteral("Photos")},
+        {QStringLiteral("serverUrl"), server.url(QStringLiteral("/api"))},
+        {QStringLiteral("apiKey"), QStringLiteral("key-1")},
+        {QStringLiteral("shareLink"), true},
+        {QStringLiteral("expireDays"), 2},
+        {QStringLiteral("publicUrl"), QStringLiteral("https://share.example.com/")},
+    };
+    const UploadOutcome outcome =
+        runJob(immichProvider()->createJob(settings, testServices(&m_network), nullptr), writeClip());
+    QVERIFY2(outcome.ok, qPrintable(outcome.error));
+    QCOMPARE(outcome.url, QStringLiteral("https://share.example.com/share/KEY"));
+    QCOMPARE(outcome.thumbnailUrl, server.url(QStringLiteral("/api/assets/asset-1/thumbnail")));
+
+    const FakeHttpServer::Request &upload = server.requests.at(0);
+    QCOMPARE(upload.headers.value("x-api-key"), QByteArray("key-1"));
+    QVERIFY(upload.body.contains("name=\"deviceId\"\r\n\r\nomacut"));
+    QVERIFY(upload.body.contains("name=\"assetData\"; filename=\"clip_trimmed.mp4\""));
+    QVERIFY(upload.body.contains("name=\"fileCreatedAt\""));
+
+    const QJsonObject link = QJsonDocument::fromJson(server.requests.at(1).body).object();
+    QCOMPARE(server.requests.at(1).target, QByteArray("/api/shared-links"));
+    QCOMPARE(link.value(QStringLiteral("type")).toString(), QStringLiteral("INDIVIDUAL"));
+    QCOMPARE(link.value(QStringLiteral("assetIds")).toArray().first().toString(), QStringLiteral("asset-1"));
+    QVERIFY(link.contains(QStringLiteral("expiresAt")));
+}
+
+void ProviderTests::immichCanLinkToTheAssetInstead() {
+    FakeHttpServer server;
+    QVERIFY(server.listen());
+    server.status = 201;
+    server.reply = R"({"id":"asset-2","status":"duplicate"})";
+
+    const QVariantMap settings{
+        {QStringLiteral("name"), QStringLiteral("Photos")},
+        {QStringLiteral("serverUrl"), server.url(QString())},
+        {QStringLiteral("apiKey"), QStringLiteral("k")},
+        {QStringLiteral("shareLink"), false},
+    };
+    const UploadOutcome outcome =
+        runJob(immichProvider()->createJob(settings, testServices(&m_network), nullptr), writeClip());
+    QCOMPARE(outcome.url, server.url(QStringLiteral("/photos/asset-2")));
+    QCOMPARE(server.requests.size(), 1);
+
+    server.status = 400;
+    server.reply = R"({"message":["assetData must be a file"],"statusCode":400})";
+    const UploadOutcome failed =
+        runJob(immichProvider()->createJob(settings, testServices(&m_network), nullptr), writeClip());
+    QCOMPARE(failed.error, QStringLiteral("Photos answered HTTP 400: assetData must be a file"));
+}
+
+void ProviderTests::xbackboneUploadsWithEitherApi() {
+    FakeHttpServer server;
+    QVERIFY(server.listen());
+    server.reply = R"({"message":"OK","url":"https://x.example/ab/cd","raw_url":"https://x.example/ab/cd/raw"})";
+
+    QVariantMap settings{
+        {QStringLiteral("name"), QStringLiteral("XBB")},
+        {QStringLiteral("serverUrl"), server.url(QString())},
+        {QStringLiteral("token"), QStringLiteral("token_1")},
+    };
+    UploadOutcome outcome =
+        runJob(xbackboneProvider()->createJob(settings, testServices(&m_network), nullptr), writeClip());
+    QVERIFY2(outcome.ok, qPrintable(outcome.error));
+    QCOMPARE(outcome.url, QStringLiteral("https://x.example/ab/cd"));
+    QCOMPARE(outcome.thumbnailUrl, QStringLiteral("https://x.example/ab/cd/raw"));
+    QCOMPARE(server.requests.at(0).target, QByteArray("/upload"));
+    QVERIFY(server.requests.at(0).body.contains("name=\"token\"\r\n\r\ntoken_1"));
+    QVERIFY(server.requests.at(0).body.contains("name=\"upload\"; filename="));
+
+    server.reply = R"({"data":{"preview_ext_url":"https://x.example/p.mp4","raw_url":"https://x.example/r","deletion_url":"https://x.example/d"}})";
+    settings.insert(QStringLiteral("api"), QStringLiteral("API v1 (/api/v1/upload)"));
+    outcome = runJob(xbackboneProvider()->createJob(settings, testServices(&m_network), nullptr), writeClip());
+    QVERIFY2(outcome.ok, qPrintable(outcome.error));
+    QCOMPARE(outcome.url, QStringLiteral("https://x.example/p.mp4"));
+    QCOMPARE(outcome.deletionUrl, QStringLiteral("https://x.example/d"));
+    QCOMPARE(server.requests.at(1).target, QByteArray("/api/v1/upload"));
+    QCOMPARE(server.requests.at(1).headers.value("authorization"), QByteArray("Bearer token_1"));
+    QVERIFY(server.requests.at(1).body.contains("name=\"file\"; filename="));
+
+    server.status = 401;
+    server.reply = R"({"message":"Token not found."})";
+    outcome = runJob(xbackboneProvider()->createJob(settings, testServices(&m_network), nullptr), writeClip());
+    QCOMPARE(outcome.error, QStringLiteral("XBB answered HTTP 401: Token not found."));
+}
+
+void ProviderTests::imgurUploadsVideosAnonymously() {
+    FakeHttpServer server;
+    QVERIFY(server.listen());
+    server.reply = R"({"data":{"id":"a1","link":"https://i.imgur.com/a1.mp4","deletehash":"dh"},"success":true,"status":200})";
+
+    QVariantMap settings{
+        {QStringLiteral("name"), QStringLiteral("Imgur")},
+        {QStringLiteral("clientId"), QStringLiteral(" cid ")},
+        {QStringLiteral("apiUrl"), server.url(QString())},
+    };
+    UploadOutcome outcome =
+        runJob(imgurProvider()->createJob(settings, testServices(&m_network), nullptr), writeClip());
+    QVERIFY2(outcome.ok, qPrintable(outcome.error));
+    QCOMPARE(outcome.url, QStringLiteral("https://i.imgur.com/a1.mp4"));
+    QCOMPARE(outcome.deletionUrl, QStringLiteral("https://imgur.com/delete/dh"));
+    QCOMPARE(server.requests.at(0).target, QByteArray("/3/upload"));
+    QCOMPARE(server.requests.at(0).headers.value("authorization"), QByteArray("Client-ID cid"));
+    QVERIFY(server.requests.at(0).body.contains("name=\"video\"; filename=\"clip_trimmed.mp4\""));
+
+    server.status = 400;
+    server.reply = R"({"data":{"error":{"message":"File is over the size limit"}},"success":false})";
+    outcome = runJob(imgurProvider()->createJob(settings, testServices(&m_network), nullptr), writeClip());
+    QCOMPARE(outcome.error, QStringLiteral("Imgur answered HTTP 400: File is over the size limit"));
+}
+
+void ProviderTests::everyProviderDescribesItsFields() {
+    QStringList ids;
+    for (const Provider *provider : providers()) {
+        ids << provider->id();
+        QVERIFY(!provider->name().isEmpty());
+        QVERIFY(!provider->description().isEmpty());
+        QSet<QString> keys;
+        for (const Field &field : provider->fields()) {
+            QVERIFY2(!keys.contains(field.key), qPrintable(field.key));
+            keys.insert(field.key);
+            QVERIFY(!field.label.isEmpty());
+            if (field.type == Field::Choice)
+                QVERIFY(field.choices.contains(field.defaultValue.toString()));
+        }
+        QCOMPARE(findProvider(provider->id()), provider);
+    }
+    QCOMPARE(ids.size(), QSet<QString>(ids.begin(), ids.end()).size());
+    QVERIFY(!findProvider(QStringLiteral("missing")));
 }
 
 QTEST_GUILESS_MAIN(ProviderTests)

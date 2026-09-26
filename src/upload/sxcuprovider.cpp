@@ -1,6 +1,4 @@
 #include <QFileInfo>
-#include <QHttpMultiPart>
-#include <QMimeDatabase>
 #include <QUrlQuery>
 
 #include "httpjob.h"
@@ -37,12 +35,6 @@ const char *const kBuiltIns[] = {
     })sxcu",
 };
 
-QByteArray quoted(const QString &value) {
-    QByteArray bytes = value.toUtf8();
-    bytes.replace('\\', "\\\\").replace('"', "\\\"");
-    return '"' + bytes + '"';
-}
-
 class SxcuJob : public HttpJob {
 public:
     SxcuJob(const sxcu::Destination &destination, const Services &services, QObject *parent)
@@ -69,7 +61,7 @@ public:
         for (const auto &[key, value] : m_destination.headers)
             request.setRawHeader(key.toUtf8(), sxcu::expand(value, context).toUtf8());
 
-        const QString mimeType = QMimeDatabase().mimeTypeForFile(filePath).name();
+        const QString mimeType = mimeTypeFor(filePath);
         const QByteArray method = m_destination.requestMethod.toUtf8();
         const auto handler = [this, fileName](const Reply &reply) { handle(reply, fileName); };
         const auto onProgress = [this](qint64 sent, qint64 total) { emit progress(sent, total); };
@@ -81,22 +73,11 @@ public:
             return;
         }
 
-        auto *multipart = new QHttpMultiPart(QHttpMultiPart::FormDataType);
-        for (const auto &[key, value] : m_destination.arguments) {
-            QHttpPart part;
-            part.setHeader(QNetworkRequest::ContentDispositionHeader,
-                           QByteArray("form-data; name=") + quoted(key));
-            part.setBody(sxcu::expand(value, context).toUtf8());
-            multipart->append(part);
-        }
-        QHttpPart filePart;
-        filePart.setHeader(QNetworkRequest::ContentDispositionHeader,
-                           QByteArray("form-data; name=") + quoted(m_destination.fileFormName)
-                               + "; filename=" + quoted(fileName));
-        filePart.setHeader(QNetworkRequest::ContentTypeHeader, mimeType);
-        filePart.setBodyDevice(file);
-        file->setParent(multipart);
-        multipart->append(filePart);
+        QList<QPair<QString, QString>> fields;
+        for (const auto &[key, value] : m_destination.arguments)
+            fields.append({key, sxcu::expand(value, context)});
+        QHttpMultiPart *multipart =
+            formData(fields, m_destination.fileFormName, fileName, file, mimeType);
         send(request, method, multipart, handler, onProgress);
     }
 

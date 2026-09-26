@@ -8,6 +8,7 @@
 #include <QVariantList>
 #include <QVariantMap>
 
+#include <functional>
 #include <memory>
 
 #include "provider.h"
@@ -64,22 +65,30 @@ public:
     Q_INVOKABLE QString lastError() const { return m_lastError; }
     Q_INVOKABLE void remove(const QString &id);
 
-    // Runs the provider's browser sign-in for a saved host and stores what it
-    // returns; ends with authorizeFinished.
-    Q_INVOKABLE void authorize(const QString &id);
+    // Runs the provider's browser sign-in with the settings being edited
+    // (over the saved ones when id is set). What it returns is kept for the
+    // next save of that form; ends with authorizeFinished.
+    Q_INVOKABLE void authorize(const QString &id, const QString &providerId,
+                               const QVariantMap &values);
     Q_INVOKABLE void cancelAuthorize();
+    // Forgets a sign-in that wasn't saved, when its form closes.
+    Q_INVOKABLE void discardAuthorization();
 
     // A job uploading to the host, or null with the reason in lastError.
     Job *createJob(const QString &id, QObject *parent);
 
     void setNetwork(QNetworkAccessManager *network) { m_network = network; }
+    // Replaces opening sign-in pages in the browser (tests).
+    void setUrlOpener(std::function<bool(const QUrl &)> open) { m_openUrl = std::move(open); }
 
 signals:
     void changed();
     void authorizingChanged();
     void authorizeStatus(const QString &message);
-    // error is empty on success; summary says what was connected.
-    void authorizeFinished(const QString &id, const QString &error, const QString &summary);
+    // error is empty on success; summary says what was connected, and
+    // formValues holds the visible settings it changed plus "secretsSet".
+    void authorizeFinished(const QString &error, const QString &summary,
+                           const QVariantMap &formValues);
 
 private:
     Services servicesFor(const QString &id);
@@ -93,8 +102,11 @@ private:
     QNetworkAccessManager m_ownNetwork;
     QNetworkAccessManager *m_network = &m_ownNetwork;
     QList<Host> m_hosts;
+    std::function<bool(const QUrl &)> m_openUrl;
     QString m_lastError;
     QPointer<Authorization> m_authorization;
+    QString m_pendingProvider;
+    QVariantMap m_pending;
 };
 
 }

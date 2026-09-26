@@ -1,5 +1,5 @@
 # The upload hosts and providers, shared by the app and the test suites.
-QT += network
+QT += gui network
 
 INCLUDEPATH += $$PWD
 
@@ -15,9 +15,13 @@ HEADERS += \
 SOURCES += \
     $$PWD/hosts.cpp \
     $$PWD/httpjob.cpp \
+    $$PWD/imgurprovider.cpp \
+    $$PWD/immichprovider.cpp \
+    $$PWD/nextcloudprovider.cpp \
     $$PWD/provider.cpp \
     $$PWD/s3provider.cpp \
     $$PWD/secretstore.cpp \
     $$PWD/sigv4.cpp \
     $$PWD/sxcu.cpp \
-    $$PWD/sxcuprovider.cpp
+    $$PWD/sxcuprovider.cpp \
+    $$PWD/xbackboneprovider.cpp

@@ -1,9 +1,7 @@
 #include <QDateTime>
 #include <QFile>
 #include <QFileInfo>
-#include <QMimeDatabase>
 #include <QNetworkReply>
-#include <QRandomGenerator>
 #include <QXmlStreamReader>
 
 #include "httpjob.h"
@@ -32,34 +30,6 @@ QString xmlValue(const QByteArray &xml, const QString &tag) {
             return reader.readElementText().trimmed();
     }
     return {};
-}
-
-// %y, %mo, %d, %h, %mi and %s in an object prefix become today's date and time.
-QString expandPrefix(QString prefix, const QDateTime &now) {
-    const QList<QPair<QString, QString>> tokens = {
-        {QStringLiteral("%mo"), now.toString(QStringLiteral("MM"))},
-        {QStringLiteral("%mi"), now.toString(QStringLiteral("mm"))},
-        {QStringLiteral("%y"), now.toString(QStringLiteral("yyyy"))},
-        {QStringLiteral("%d"), now.toString(QStringLiteral("dd"))},
-        {QStringLiteral("%h"), now.toString(QStringLiteral("HH"))},
-        {QStringLiteral("%s"), now.toString(QStringLiteral("ss"))},
-    };
-    for (const auto &[token, value] : tokens)
-        prefix.replace(token, value);
-    return prefix;
-}
-
-// "clip_trimmed.mp4" -> "clip_trimmed-k3x9qa.mp4", so repeat uploads of a
-// same-named trim never overwrite each other.
-QString uniqueName(const QString &fileName) {
-    static const char alphabet[] = "abcdefghijklmnopqrstuvwxyz0123456789";
-    QString tag;
-    for (int i = 0; i < 6; ++i)
-        tag += QLatin1Char(alphabet[QRandomGenerator::global()->bounded(36)]);
-    const QFileInfo info(fileName);
-    const QString suffix = info.completeSuffix();
-    return info.baseName() + QLatin1Char('-') + tag
-        + (suffix.isEmpty() ? QString() : QLatin1Char('.') + suffix);
 }
 
 class S3Job : public HttpJob {
@@ -99,17 +69,17 @@ public:
         m_file = openFile(filePath);
         if (!m_file)
             return;
-        m_contentType = QMimeDatabase().mimeTypeForFile(filePath).name().toLatin1();
+        m_contentType = mimeTypeFor(filePath).toLatin1();
 
         const QDateTime now = QDateTime::currentDateTime();
-        QString prefix = expandPrefix(text(m_settings, "objectPrefix"), now);
+        QString prefix = expandDateTokens(text(m_settings, "objectPrefix"), now);
         while (prefix.startsWith(QLatin1Char('/')))
             prefix.remove(0, 1);
         if (!prefix.isEmpty() && !prefix.endsWith(QLatin1Char('/')))
             prefix += QLatin1Char('/');
         const QString fileName = QFileInfo(filePath).fileName();
         m_key = prefix
-            + (m_settings.value(QStringLiteral("uniqueNames"), true).toBool() ? uniqueName(fileName)
+            + (m_settings.value(QStringLiteral("uniqueNames"), true).toBool() ? taggedFileName(fileName)
                                                                               : fileName);
 
         m_size = m_file->size();
