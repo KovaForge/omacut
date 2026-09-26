@@ -7,10 +7,9 @@ INCLUDEPATH += ../src
 
 HEADERS += \
     fakehttpserver.h \
-    ../src/sxcu.h \
-    ../src/uploader.h
+    uploadtestkit.h
 
 SOURCES += \
-    uploader_tests.cpp \
-    ../src/sxcu.cpp \
-    ../src/uploader.cpp
+    uploader_tests.cpp
+
+include(../src/upload/upload.pri)

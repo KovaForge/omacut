@@ -15,12 +15,14 @@
 #include <memory>
 
 #include "ffmpeg.h"
-#include "sxcu.h"
 
 class ThumbProvider;
 class FilePicker;
 class ThumbWorker;
-class Uploader;
+namespace upload {
+class Hosts;
+class Job;
+}
 class QTemporaryDir;
 
 // The bridge between QML and the ffmpeg/ffprobe layer. Holds the currently
@@ -40,6 +42,8 @@ class Backend : public QObject {
     Q_PROPERTY(int uploadDestination READ uploadDestination WRITE setUploadDestination NOTIFY uploadDestinationsChanged)
     Q_PROPERTY(QString uploadDestinationsDir READ uploadDestinationsDir CONSTANT)
     Q_PROPERTY(bool uploading READ uploading NOTIFY uploadingChanged)
+    // The upload::Hosts the settings screen manages hosts through.
+    Q_PROPERTY(QObject *hosts READ hosts CONSTANT)
 
 public:
     explicit Backend(ThumbProvider *provider, QObject *parent = nullptr);
@@ -62,6 +66,8 @@ public:
     // Where user .sxcu files go, with the home directory shown as ~.
     QString uploadDestinationsDir() const;
     bool uploading() const { return m_uploading; }
+    QObject *hosts() const;
+    upload::Hosts *uploadHosts() const { return m_hosts; }
 
     // The accent from an omarchy colors.toml, or the fallback when the file is
     // missing or holds no usable accent — which is what keeps omacut working on
@@ -93,8 +99,8 @@ public:
     // The full-length strip is cached, so zooming back out restores instantly.
     Q_INVOKABLE void requestThumbs(double start, double end);
 
-    // Re-read the built-in and user (.sxcu) upload destinations, keeping the
-    // remembered choice.
+    // Re-read the configured hosts and .sxcu files, keeping the remembered
+    // choice.
     Q_INVOKABLE void reloadUploadDestinations();
     // The downscale heights an upload can pick from, like exportHeights.
     Q_INVOKABLE QList<int> uploadHeights() const;
@@ -133,7 +139,8 @@ private:
     // set here and left for done to clear.
     void encodeClip(const QString &outPath, double start, double end, int scaleHeight,
                     const QString &verb, std::function<void(const QString &)> done);
-    void wireUploader();
+    void wireJob(upload::Job *job);
+    void syncUploadDestinations();
     void finishUpload();
     void appendUploadHistory(const QString &url, const QString &thumbnailUrl,
                              const QString &deletionUrl) const;
@@ -165,9 +172,10 @@ private:
     QTimer m_thumbRevealTimer;
     QFileSystemWatcher m_themeWatcher;
     QPointer<QProcess> m_encoder;
-    Uploader *m_uploader = nullptr;
-    QList<sxcu::Destination> m_uploadDestinations;
+    upload::Hosts *m_hosts = nullptr;
+    QPointer<upload::Job> m_job;
     QStringList m_uploadDestinationNames;
+    QStringList m_uploadHostIds;
     int m_uploadDestination = -1;
     QString m_uploadDestinationName;
     QString m_uploadSource;

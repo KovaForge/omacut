@@ -21,7 +21,7 @@
 #include "filepicker.h"
 #include "thumbprovider.h"
 #include "thumbworker.h"
-#include "uploader.h"
+#include "upload/hosts.h"
 
 class FakeFilePicker : public FilePicker {
     Q_OBJECT
@@ -252,6 +252,10 @@ private:
     // backend has picked it up.
     int useFakeDestination(Backend &backend, const FakeHttpServer &server);
     QStringList uploadHistory() const;
+    static QString uploadersDir() {
+        return QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation)
+            + QStringLiteral("/omacut/uploaders");
+    }
 
     QTemporaryDir m_dir;
     QString m_videoPath;
@@ -263,10 +267,11 @@ void BackendTests::initTestCase() {
     // Keep settings, user uploaders and the upload history out of the real
     // ~/.config and ~/.local/state.
     QStandardPaths::setTestModeEnabled(true);
-    QDir(uploads::userDestinationsDir()).removeRecursively();
+    QDir(QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation)
+         + QStringLiteral("/omacut")).removeRecursively();
+    QDir(QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)
+         + QStringLiteral("/omacut")).removeRecursively();
     QFile::remove(Backend::uploadHistoryPath());
-    QFile::remove(QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation)
-                  + QStringLiteral("/omacut/omacut.conf"));
 
     QVERIFY2(m_dir.isValid(), "temporary directory is valid");
     m_videoPath = m_dir.filePath(QStringLiteral("clip.mp4"));
@@ -1051,7 +1056,7 @@ void BackendTests::themeAccentForegroundKeepsContrast() {
 }
 
 int BackendTests::useFakeDestination(Backend &backend, const FakeHttpServer &server) {
-    const QString dir = uploads::userDestinationsDir();
+    const QString dir = uploadersDir();
     QDir().mkpath(dir);
     QFile file(QDir(dir).filePath(QStringLiteral("local.sxcu")));
     if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
@@ -1089,7 +1094,7 @@ void BackendTests::uploadDestinationsIncludeBuiltInsAndUserFiles() {
     QCOMPARE(index, builtIns.size());
     QVERIFY(changed.count() >= 1);
     QVERIFY(backend.uploadDestinationsDir().endsWith(QStringLiteral("/omacut/uploaders")));
-    QDir(uploads::userDestinationsDir()).removeRecursively();
+    QDir(uploadersDir()).removeRecursively();
 }
 
 void BackendTests::uploadDestinationIsRemembered() {
@@ -1159,7 +1164,7 @@ void BackendTests::uploadClipEncodesUploadsAndCopiesTheLink() {
     QCOMPARE(entry.value(QStringLiteral("destination")).toString(), QStringLiteral("Local test"));
     QCOMPARE(entry.value(QStringLiteral("source")).toString(), m_videoPath);
 
-    QDir(uploads::userDestinationsDir()).removeRecursively();
+    QDir(uploadersDir()).removeRecursively();
 }
 
 void BackendTests::uploadFailureClearsBusyWithoutHistory() {
@@ -1187,7 +1192,7 @@ void BackendTests::uploadFailureClearsBusyWithoutHistory() {
     QVERIFY(copied.isEmpty());
     QCOMPARE(uploadHistory().size(), historyBefore);
 
-    QDir(uploads::userDestinationsDir()).removeRecursively();
+    QDir(uploadersDir()).removeRecursively();
 }
 
 void BackendTests::uploadZeroLengthClipFails() {
@@ -1213,7 +1218,7 @@ void BackendTests::uploadCanBeCancelled() {
     ThumbProvider provider;
     Backend backend(&provider, new FakeFilePicker);
     QVERIFY(useFakeDestination(backend, unused) >= 0);
-    QFile sxcuFile(QDir(uploads::userDestinationsDir()).filePath(QStringLiteral("local.sxcu")));
+    QFile sxcuFile(QDir(uploadersDir()).filePath(QStringLiteral("local.sxcu")));
     QVERIFY(sxcuFile.open(QIODevice::WriteOnly | QIODevice::Truncate));
     sxcuFile.write(QStringLiteral(R"({"Name": "Local test", "RequestURL": "http://127.0.0.1:%1/",
                                       "FileFormName": "file"})")
@@ -1234,7 +1239,7 @@ void BackendTests::uploadCanBeCancelled() {
     QVERIFY(!backend.busy());
     QVERIFY(!backend.uploading());
 
-    QDir(uploads::userDestinationsDir()).removeRecursively();
+    QDir(uploadersDir()).removeRecursively();
 }
 
 QTEST_MAIN(BackendTests)

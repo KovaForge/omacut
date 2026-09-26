@@ -22,13 +22,13 @@
 #include "portalfilepicker.h"
 #include "thumbprovider.h"
 #include "thumbworker.h"
-#include "uploader.h"
+#include "upload/hosts.h"
 
 namespace {
 constexpr int kThumbCount = 12;
 constexpr int kThumbRevealMs = 70;
 const QString kDefaultAccent = QStringLiteral("#FFD60A");
-const QString kUploadDestinationKey = QStringLiteral("upload/destination");
+const QString kUploadHostKey = QStringLiteral("upload/host");
 // Settings live in ~/.config/omacut/omacut.conf, beside the user's uploaders.
 const QString kSettingsName = QStringLiteral("omacut");
 
@@ -67,9 +67,15 @@ Backend::Backend(ThumbProvider *provider, FilePicker *filePicker, QObject *paren
     if (!m_filePicker->parent())
         m_filePicker->setParent(this);
     wireFilePicker();
-    wireUploader();
     m_copyLink = &Backend::copyToClipboard;
-    reloadUploadDestinations();
+    const QString dataDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)
+        + QStringLiteral("/omacut");
+    m_hosts = new upload::Hosts(
+        QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation)
+            + QStringLiteral("/omacut"),
+        upload::SecretStore::system(dataDir), this);
+    connect(m_hosts, &upload::Hosts::changed, this, &Backend::syncUploadDestinations);
+    syncUploadDestinations();
     m_thumbRevealTimer.setInterval(kThumbRevealMs);
     connect(&m_thumbRevealTimer, &QTimer::timeout, this, &Backend::revealNextThumb);
 
@@ -93,26 +99,6 @@ void Backend::wireFilePicker() {
     connect(m_filePicker, &FilePicker::openSelected, this, &Backend::load);
     connect(m_filePicker, &FilePicker::exportSelected, this, &Backend::exportClip);
     connect(m_filePicker, &FilePicker::failed, this, &Backend::loadError);
-}
-
-void Backend::wireUploader() {
-    m_uploader = new Uploader(this);
-    connect(m_uploader, &Uploader::progress, this, [this](qint64 sent, qint64 total) {
-        if (total > 0)
-            setStatus(QStringLiteral("Uploading %1%").arg(qBound(0, int(sent * 100 / total), 100)));
-    });
-    connect(m_uploader, &Uploader::finished, this,
-            [this](const QString &url, const QString &thumbnailUrl, const QString &deletionUrl) {
-                if (m_copyLink)
-                    m_copyLink(url);
-                appendUploadHistory(url, thumbnailUrl, deletionUrl);
-                finishUpload();
-                emit uploadDone(url, deletionUrl);
-            });
-    connect(m_uploader, &Uploader::failed, this, [this](const QString &message) {
-        finishUpload();
-        emit uploadFailed(message);
-    });
 }
 
 void Backend::setBusy(bool busy) {
@@ -455,8 +441,12 @@ void Backend::encodeClip(const QString &outPath, double start, double end, int s
     proc->start(ffmpegBin, args);
 }
 
+QObject *Backend::hosts() const {
+    return m_hosts;
+}
+
 QString Backend::uploadDestinationsDir() const {
-    const QString dir = uploads::userDestinationsDir();
+    const QString dir = m_hosts->uploadersDir();
     const QString home = QDir::homePath();
     return dir.startsWith(home + QLatin1Char('/')) ? QLatin1Char('~') + dir.mid(home.size()) : dir;
 }
@@ -467,34 +457,36 @@ QString Backend::uploadHistoryPath() {
 }
 
 void Backend::reloadUploadDestinations() {
-    QStringList warnings;
-    m_uploadDestinations = uploads::builtInDestinations()
-        + uploads::loadDestinations(uploads::userDestinationsDir(), &warnings);
-    for (const QString &warning : warnings)
-        qWarning("omacut: skipping uploader %s", qPrintable(warning));
+    m_hosts->reload();
+}
 
+void Backend::syncUploadDestinations() {
     QStringList names;
-    for (const sxcu::Destination &destination : m_uploadDestinations)
-        names << destination.name;
+    QStringList ids;
+    for (const upload::Host &host : m_hosts->all()) {
+        names << host.name;
+        ids << host.id;
+    }
 
-    // The choice is remembered by name, so it survives uploaders being added
-    // or removed around it.
+    // The choice is remembered by host id, so it survives hosts being added,
+    // renamed or removed around it.
     const QSettings settings(QSettings::UserScope, kSettingsName, kSettingsName);
-    const QString saved = settings.value(kUploadDestinationKey).toString();
-    const int index = qMax(0, names.indexOf(saved));
-    if (names != m_uploadDestinationNames || index != m_uploadDestination) {
+    const int index = qMax(0, ids.indexOf(settings.value(kUploadHostKey).toString()));
+    if (names != m_uploadDestinationNames || ids != m_uploadHostIds
+            || index != m_uploadDestination) {
         m_uploadDestinationNames = names;
-        m_uploadDestination = index;
+        m_uploadHostIds = ids;
+        m_uploadDestination = ids.isEmpty() ? -1 : index;
         emit uploadDestinationsChanged();
     }
 }
 
 void Backend::setUploadDestination(int index) {
-    if (index < 0 || index >= m_uploadDestinations.size() || index == m_uploadDestination)
+    if (index < 0 || index >= m_uploadHostIds.size() || index == m_uploadDestination)
         return;
     m_uploadDestination = index;
     QSettings settings(QSettings::UserScope, kSettingsName, kSettingsName);
-    settings.setValue(kUploadDestinationKey, m_uploadDestinations.at(index).name);
+    settings.setValue(kUploadHostKey, m_uploadHostIds.at(index));
     emit uploadDestinationsChanged();
 }
 
@@ -510,22 +502,30 @@ void Backend::uploadClip(double start, double end, int scaleHeight) {
         emit uploadFailed(QStringLiteral("The selected clip has no length."));
         return;
     }
-    if (m_uploadDestination < 0 || m_uploadDestination >= m_uploadDestinations.size()) {
+    if (m_uploadDestination < 0 || m_uploadDestination >= m_uploadHostIds.size()) {
         emit uploadFailed(QStringLiteral("No upload destination is set up."));
         return;
     }
+
+    // Made up front so a host missing its settings fails before encoding.
+    upload::Job *job = m_hosts->createJob(m_uploadHostIds.at(m_uploadDestination), this);
+    if (!job) {
+        emit uploadFailed(m_hosts->lastError());
+        return;
+    }
+    m_uploadDestinationName = m_uploadDestinationNames.at(m_uploadDestination);
+    wireJob(job);
 
     // The trim is encoded into a private temp dir under the same name an
     // export would suggest, since hosts show that name to whoever opens it.
     m_uploadDir = std::make_unique<QTemporaryDir>(QDir::tempPath()
                                                   + QStringLiteral("/omacut-upload-XXXXXX"));
     if (!m_uploadDir->isValid()) {
-        m_uploadDir.reset();
+        finishUpload();
         emit uploadFailed(QStringLiteral("Could not create a temporary file for the upload."));
         return;
     }
     const QString clipPath = m_uploadDir->filePath(suggestedExportUrl().fileName());
-    const sxcu::Destination destination = m_uploadDestinations.at(m_uploadDestination);
     m_uploading = true;
     m_uploadCancelled = false;
     m_uploadSource = m_path;
@@ -534,16 +534,15 @@ void Backend::uploadClip(double start, double end, int scaleHeight) {
     emit uploadingChanged();
 
     encodeClip(clipPath, start, end, scaleHeight, QStringLiteral("Encoding"),
-               [this, clipPath, destination](const QString &error) {
+               [this, clipPath](const QString &error) {
                    if (m_uploadCancelled || !error.isEmpty()) {
                        finishUpload();
                        emit uploadFailed(m_uploadCancelled ? QStringLiteral("Upload cancelled.")
                                                            : error);
                        return;
                    }
-                   m_uploadDestinationName = destination.name;
                    setStatus(QStringLiteral("Uploading 0%"));
-                   m_uploader->upload(destination, clipPath);
+                   m_job->start(clipPath);
                });
 }
 
@@ -551,13 +550,37 @@ void Backend::cancelUpload() {
     if (!m_uploading)
         return;
     m_uploadCancelled = true;
-    if (m_uploader->busy())
-        m_uploader->cancel();
-    else if (m_encoder)
+    if (m_encoder)
         m_encoder->kill();
+    else if (m_job)
+        m_job->cancel();
+}
+
+void Backend::wireJob(upload::Job *job) {
+    m_job = job;
+    connect(job, &upload::Job::progress, this, [this](qint64 sent, qint64 total) {
+        if (total > 0)
+            setStatus(QStringLiteral("Uploading %1%").arg(qBound(0, int(sent * 100 / total), 100)));
+    });
+    connect(job, &upload::Job::finished, this, [this](const upload::Outcome &outcome) {
+        if (m_copyLink)
+            m_copyLink(outcome.url);
+        appendUploadHistory(outcome.url, outcome.thumbnailUrl, outcome.deletionUrl);
+        finishUpload();
+        emit uploadDone(outcome.url, outcome.deletionUrl);
+    });
+    connect(job, &upload::Job::failed, this, [this](const QString &message) {
+        finishUpload();
+        emit uploadFailed(message);
+    });
 }
 
 void Backend::finishUpload() {
+    if (m_job) {
+        m_job->disconnect(this);
+        m_job->deleteLater();
+        m_job = nullptr;
+    }
     m_uploadDir.reset();
     setBusy(false);
     setStatus(QString());

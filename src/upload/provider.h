@@ -1,0 +1,132 @@
+#pragma once
+
+#include <QList>
+#include <QObject>
+#include <QString>
+#include <QStringList>
+#include <QVariant>
+#include <QVariantMap>
+
+#include <functional>
+
+class QNetworkAccessManager;
+
+// The pieces every upload destination is built from: a Provider describes a
+// kind of host (S3, Dropbox, …) and the settings it needs, and makes a Job
+// for each upload to a configured host.
+namespace upload {
+
+// One setting a provider asks for. The settings screen is generated from
+// these, and Secret values are kept in the keyring rather than hosts.json.
+struct Field {
+    enum Type {
+        Text,
+        Multiline,
+        Secret,
+        Number,
+        Toggle,
+        Choice,
+        // An ordered pick of other hosts (Auto).
+        Hosts,
+    };
+
+    QString key;
+    QString label;
+    Type type = Text;
+    QVariant defaultValue;
+    QStringList choices;
+    QString placeholder;
+    QString help;
+    bool required = false;
+    // Kept but never shown, e.g. a token a sign-in stored.
+    bool hidden = false;
+
+    QVariantMap toVariant() const;
+};
+
+// Where an upload ended up.
+struct Outcome {
+    QString url;
+    QString thumbnailUrl;
+    QString deletionUrl;
+};
+
+class Job;
+
+// What a job may lean on besides its own settings.
+struct Services {
+    QNetworkAccessManager *network = nullptr;
+    // Stores changed settings of the host being used, secrets included —
+    // e.g. a refreshed access token.
+    std::function<void(const QVariantMap &changes)> saveSettings;
+    // Makes a job for another configured host, for providers that delegate.
+    std::function<Job *(const QString &hostId, QObject *parent)> createJob;
+};
+
+// One upload. start() leads to exactly one of finished or failed, and cancel()
+// turns whatever is running into a failure with "Upload cancelled.".
+class Job : public QObject {
+    Q_OBJECT
+
+public:
+    using QObject::QObject;
+
+    virtual void start(const QString &filePath) = 0;
+    virtual void cancel() = 0;
+
+signals:
+    void progress(qint64 sent, qint64 total);
+    void finished(const upload::Outcome &outcome);
+    void failed(const QString &message);
+};
+
+// A sign-in that runs in the browser. Exactly one of finished or failed
+// follows; finished carries the settings to store (tokens are Secret fields).
+class Authorization : public QObject {
+    Q_OBJECT
+
+public:
+    using QObject::QObject;
+    virtual void start() = 0;
+    virtual void cancel() = 0;
+
+signals:
+    // A line for the settings screen while waiting ("Waiting for Dropbox…").
+    void status(const QString &message);
+    void finished(const QVariantMap &changes, const QString &summary);
+    void failed(const QString &message);
+};
+
+class Provider {
+public:
+    virtual ~Provider() = default;
+
+    virtual QString id() const = 0;
+    virtual QString name() const = 0;
+    virtual QString description() const = 0;
+    virtual QList<Field> fields() const = 0;
+
+    // Why these settings can't upload, or empty. The default checks that
+    // required fields are filled in.
+    virtual QString validate(const QVariantMap &settings) const;
+
+    virtual Job *createJob(const QVariantMap &settings, const Services &services,
+                           QObject *parent) const = 0;
+
+    // Providers that sign in through the browser instead of (or besides)
+    // pasting a key.
+    virtual QString authorizeLabel() const { return {}; }
+    virtual Authorization *authorize(const QVariantMap &settings, const Services &services,
+                                     QObject *parent) const;
+
+    // settings with each field's default filled in where it's missing.
+    QVariantMap withDefaults(const QVariantMap &settings) const;
+};
+
+// Every provider, in the order the settings screen offers them.
+const QList<const Provider *> &providers();
+const Provider *findProvider(const QString &id);
+
+}
+
+Q_DECLARE_METATYPE(upload::Outcome)

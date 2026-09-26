@@ -5,33 +5,12 @@
 
 #include "fakehttpserver.h"
 #include "sxcu.h"
-#include "uploader.h"
+#include "hosts.h"
+#include "providers.h"
+#include "secretstore.h"
+#include "uploadtestkit.h"
 
-struct UploadOutcome {
-    bool done = false;
-    bool ok = false;
-    QString url;
-    QString thumbnailUrl;
-    QString deletionUrl;
-    QString error;
-};
-
-// Runs one upload to completion.
-static UploadOutcome runUpload(const sxcu::Destination &destination, const QString &path) {
-    Uploader uploader;
-    UploadOutcome outcome;
-    QObject::connect(&uploader, &Uploader::finished, &uploader,
-                     [&](const QString &url, const QString &thumb, const QString &deletion) {
-                         outcome = {true, true, url, thumb, deletion, {}};
-                     });
-    QObject::connect(&uploader, &Uploader::failed, &uploader, [&](const QString &message) {
-        outcome = {true, false, {}, {}, {}, message};
-    });
-    uploader.upload(destination, path);
-    if (!QTest::qWaitFor([&] { return outcome.done; }, 10000))
-        outcome.error = QStringLiteral("timed out");
-    return outcome;
-}
+using namespace upload;
 
 class UploaderTests : public QObject {
     Q_OBJECT
@@ -49,8 +28,13 @@ private slots:
     void expandNestsAndEscapes();
     void expandDropsUnknownFunctions();
     void jsonPathHandlesValueTypes();
-    void builtInDestinationsAreValid();
-    void userDestinationsLoadSortedAndSkipBadFiles();
+    void builtInHostsAreValid();
+    void sxcuFilesBecomeReadOnlyHosts();
+    void hostsSaveEditAndRemove();
+    void hostsValidateBeforeSaving();
+    void hostsRefuseToEditReadOnlyHosts();
+    void hostsMakeJobsWithSecretsFilledIn();
+    void fileSecretStoreIsPrivate();
     void multipartUploadSendsArgumentsAndFile();
     void binaryUploadSendsTheFileAsTheBody();
     void uploadReadsLinksFromTheResponse();
@@ -63,9 +47,21 @@ private slots:
 private:
     QString writeClip(const QByteArray &content = "fake mp4 bytes");
     sxcu::Destination destinationFor(const FakeHttpServer &server);
+    UploadOutcome runUpload(const sxcu::Destination &destination, const QString &path);
+    Job *sxcuJob(const sxcu::Destination &destination);
 
     QTemporaryDir m_dir;
+    QNetworkAccessManager m_network;
 };
+
+Job *UploaderTests::sxcuJob(const sxcu::Destination &destination) {
+    return sxcuProvider()->createJob({{QStringLiteral("definition"), sxcuJson(destination)}},
+                                     testServices(&m_network), nullptr);
+}
+
+UploadOutcome UploaderTests::runUpload(const sxcu::Destination &destination, const QString &path) {
+    return runJob(sxcuJob(destination), path);
+}
 
 QString UploaderTests::writeClip(const QByteArray &content) {
     const QString path = m_dir.filePath(QStringLiteral("clip_trimmed.mp4"));
@@ -244,7 +240,7 @@ void UploaderTests::jsonPathHandlesValueTypes() {
     QCOMPARE(sxcu::jsonPath(json, QStringLiteral("n")), QStringLiteral("1.5"));
     QCOMPARE(sxcu::jsonPath(json, QStringLiteral("i")), QStringLiteral("7"));
     QCOMPARE(sxcu::jsonPath(json, QStringLiteral("b")), QStringLiteral("false"));
-    QCOMPARE(sxcu::jsonPath(json, QStringLiteral("o")), QStringLiteral(R"({"k":1})"));
+    QCOMPARE(sxcu::jsonPath(json, QStringLiteral("o")), QString::fromUtf8(R"({"k":1})"));
     QCOMPARE(sxcu::jsonPath(json, QStringLiteral("a")), QStringLiteral("[1,2]"));
     QCOMPARE(sxcu::jsonPath(json, QStringLiteral("a[1]")), QStringLiteral("2"));
     QCOMPARE(sxcu::jsonPath("[{\"u\": \"top\"}]", QStringLiteral("[0].u")), QStringLiteral("top"));
@@ -252,21 +248,30 @@ void UploaderTests::jsonPathHandlesValueTypes() {
     QCOMPARE(sxcu::jsonPath(json, QStringLiteral("s.deeper")), QString());
 }
 
-void UploaderTests::builtInDestinationsAreValid() {
-    const QList<sxcu::Destination> destinations = uploads::builtInDestinations();
+void UploaderTests::builtInHostsAreValid() {
+    QTemporaryDir config;
+    Hosts hosts(config.path(), std::make_unique<MemorySecretStore>());
     QStringList names;
-    for (const sxcu::Destination &d : destinations) {
-        names << d.name;
-        QVERIFY(d.requestUrl.startsWith(QStringLiteral("https://")));
+    QStringList ids;
+    for (const Host &host : hosts.all()) {
+        names << host.name;
+        ids << host.id;
+        QVERIFY(host.readOnly);
+        QCOMPARE(host.provider, QStringLiteral("sxcu"));
+        QVERIFY(sxcuProvider()->validate(host.settings).isEmpty());
     }
     QCOMPARE(names, (QStringList{QStringLiteral("Litterbox (72 hours)"), QStringLiteral("Catbox"),
                                  QStringLiteral("Uguu (3 hours)")}));
+    QCOMPARE(ids, (QStringList{QStringLiteral("builtin:litterbox"), QStringLiteral("builtin:catbox"),
+                               QStringLiteral("builtin:uguu")}));
 }
 
-void UploaderTests::userDestinationsLoadSortedAndSkipBadFiles() {
-    QTemporaryDir dir;
+void UploaderTests::sxcuFilesBecomeReadOnlyHosts() {
+    QTemporaryDir config;
+    const QString dir = config.filePath(QStringLiteral("uploaders"));
+    QVERIFY(QDir().mkpath(dir));
     const auto write = [&](const QString &name, const QByteArray &content) {
-        QFile file(dir.filePath(name));
+        QFile file(QDir(dir).filePath(name));
         QVERIFY(file.open(QIODevice::WriteOnly));
         file.write(content);
     };
@@ -275,15 +280,130 @@ void UploaderTests::userDestinationsLoadSortedAndSkipBadFiles() {
     write(QStringLiteral("broken.sxcu"), "{");
     write(QStringLiteral("ignored.json"), R"({"RequestURL": "https://c.example", "FileFormName": "f"})");
 
-    QStringList warnings;
-    const QList<sxcu::Destination> destinations = uploads::loadDestinations(dir.path(), &warnings);
-    QCOMPARE(destinations.size(), 2);
-    QCOMPARE(destinations.at(0).name, QStringLiteral("alpha"));
-    QCOMPARE(destinations.at(1).name, QStringLiteral("Beta"));
-    QCOMPARE(warnings.size(), 1);
-    QVERIFY(warnings.first().startsWith(QStringLiteral("broken.sxcu: ")));
+    Hosts hosts(config.path(), std::make_unique<MemorySecretStore>());
+    QCOMPARE(hosts.uploadersDir(), dir);
+    const QList<Host> all = hosts.all();
+    QCOMPARE(all.size(), 5);
+    // Files come after the built-ins, in file-name order.
+    QCOMPARE(all.at(3).id, QStringLiteral("file:a.sxcu"));
+    QCOMPARE(all.at(3).name, QStringLiteral("Beta"));
+    QCOMPARE(all.at(4).id, QStringLiteral("file:z.sxcu"));
+    QVERIFY(all.at(4).readOnly);
 
-    QVERIFY(uploads::loadDestinations(dir.filePath(QStringLiteral("missing"))).isEmpty());
+    // New files show up on reload.
+    write(QStringLiteral("m.sxcu"), R"({"Name": "Mid", "RequestURL": "https://m.example", "FileFormName": "f"})");
+    QSignalSpy changed(&hosts, &Hosts::changed);
+    hosts.reload();
+    QCOMPARE(changed.count(), 1);
+    QCOMPARE(hosts.all().size(), 6);
+}
+
+void UploaderTests::hostsSaveEditAndRemove() {
+    QTemporaryDir config;
+    QString id;
+    {
+        Hosts hosts(config.path(), std::make_unique<MemorySecretStore>());
+        const QString definition = QString::fromUtf8(R"({"RequestURL": "https://x.example", "FileFormName": "f"})");
+        id = hosts.save({}, QStringLiteral("sxcu"), QStringLiteral("  Mine  "),
+                        {{QStringLiteral("definition"), definition},
+                         {QStringLiteral("stray"), QStringLiteral("dropped")}});
+        QVERIFY2(!id.isEmpty(), qPrintable(hosts.lastError()));
+        const Host *host = hosts.find(id);
+        QVERIFY(host);
+        QCOMPARE(host->name, QStringLiteral("Mine"));
+        QVERIFY(!host->readOnly);
+        QVERIFY(!host->settings.contains(QStringLiteral("stray")));
+        QCOMPARE(hosts.values(id).value(QStringLiteral("definition")).toString(), definition);
+
+        // Saved hosts sit after the built-ins.
+        QCOMPARE(hosts.all().at(3).id, id);
+        QCOMPARE(hosts.list().at(3).toMap().value(QStringLiteral("providerName")).toString(),
+                 QStringLiteral("Custom uploader (.sxcu)"));
+
+        const QString renamed = hosts.save(id, QStringLiteral("sxcu"), QStringLiteral("Renamed"),
+                                           {{QStringLiteral("definition"), definition}});
+        QCOMPARE(renamed, id);
+    }
+
+    // hosts.json carries them over to the next start.
+    Hosts reopened(config.path(), std::make_unique<MemorySecretStore>());
+    QVERIFY(reopened.find(id));
+    QCOMPARE(reopened.find(id)->name, QStringLiteral("Renamed"));
+    reopened.remove(id);
+    QVERIFY(!reopened.find(id));
+    Hosts afterRemove(config.path(), std::make_unique<MemorySecretStore>());
+    QVERIFY(!afterRemove.find(id));
+}
+
+void UploaderTests::hostsValidateBeforeSaving() {
+    QTemporaryDir config;
+    Hosts hosts(config.path(), std::make_unique<MemorySecretStore>());
+
+    QVERIFY(hosts.save({}, QStringLiteral("nope"), QStringLiteral("x"), {}).isEmpty());
+    QCOMPARE(hosts.lastError(), QStringLiteral("Unknown kind of host."));
+
+    QVERIFY(hosts.save({}, QStringLiteral("sxcu"), QStringLiteral(" "), {}).isEmpty());
+    QCOMPARE(hosts.lastError(), QStringLiteral("Give the host a name."));
+
+    QVERIFY(hosts.save({}, QStringLiteral("sxcu"), QStringLiteral("x"), {}).isEmpty());
+    QCOMPARE(hosts.lastError(), QStringLiteral("Uploader config is required."));
+
+    const QVariantMap unusable{{QStringLiteral("definition"), QString::fromUtf8(R"({"RequestURL": "https://x"})")}};
+    QVERIFY(hosts.save({}, QStringLiteral("sxcu"), QStringLiteral("x"), unusable).isEmpty());
+    QVERIFY(hosts.lastError().startsWith(QStringLiteral("The uploader config can't be used")));
+    QCOMPARE(hosts.all().size(), 3);
+}
+
+void UploaderTests::hostsRefuseToEditReadOnlyHosts() {
+    QTemporaryDir config;
+    Hosts hosts(config.path(), std::make_unique<MemorySecretStore>());
+    const QString definition = hosts.values(QStringLiteral("builtin:catbox"))
+                                   .value(QStringLiteral("definition"))
+                                   .toString();
+    const QVariantMap values{{QStringLiteral("definition"), definition}};
+    QVERIFY(hosts.save(QStringLiteral("builtin:catbox"), QStringLiteral("sxcu"),
+                       QStringLiteral("Mine now"), values).isEmpty());
+    QCOMPARE(hosts.lastError(), QStringLiteral("This host can't be edited."));
+    hosts.remove(QStringLiteral("builtin:catbox"));
+    QVERIFY(hosts.find(QStringLiteral("builtin:catbox")));
+}
+
+void UploaderTests::hostsMakeJobsWithSecretsFilledIn() {
+    FakeHttpServer server;
+    QVERIFY(server.listen());
+    server.reply = "https://files.example/x.mp4";
+
+    QTemporaryDir config;
+    Hosts hosts(config.path(), std::make_unique<MemorySecretStore>());
+    hosts.setNetwork(&m_network);
+    const QString id = hosts.save({}, QStringLiteral("sxcu"), QStringLiteral("Mine"),
+                                  {{QStringLiteral("definition"), sxcuJson(destinationFor(server))}});
+    QVERIFY(!id.isEmpty());
+
+    const UploadOutcome outcome = runJob(hosts.createJob(id, nullptr), writeClip());
+    QVERIFY2(outcome.ok, qPrintable(outcome.error));
+    QCOMPARE(outcome.url, QStringLiteral("https://files.example/x.mp4"));
+
+    QVERIFY(!hosts.createJob(QStringLiteral("gone"), nullptr));
+    QCOMPARE(hosts.lastError(), QStringLiteral("That host no longer exists."));
+}
+
+void UploaderTests::fileSecretStoreIsPrivate() {
+    QTemporaryDir dir;
+    const QString path = dir.filePath(QStringLiteral("nested/secrets.json"));
+    FileSecretStore store(path);
+    QVERIFY(store.read(QStringLiteral("a")).isEmpty());
+    QVERIFY(store.write(QStringLiteral("a"), QStringLiteral("1")));
+    QVERIFY(store.write(QStringLiteral("b"), QStringLiteral("2")));
+    QCOMPARE(store.read(QStringLiteral("a")), QStringLiteral("1"));
+    QCOMPARE(QFileInfo(path).permissions() & (QFileDevice::ReadGroup | QFileDevice::ReadOther),
+             QFileDevice::Permissions());
+
+    FileSecretStore reopened(path);
+    QCOMPARE(reopened.read(QStringLiteral("b")), QStringLiteral("2"));
+    reopened.remove(QStringLiteral("a"));
+    reopened.remove(QStringLiteral("b"));
+    QVERIFY(!QFileInfo::exists(path));
 }
 
 void UploaderTests::multipartUploadSendsArgumentsAndFile() {
@@ -405,12 +525,9 @@ void UploaderTests::uploadReportsUnreadableFiles() {
     destination.requestUrl = QStringLiteral("http://127.0.0.1:1/");
     destination.fileFormName = QStringLiteral("f");
 
-    Uploader uploader;
-    QSignalSpy failed(&uploader, &Uploader::failed);
-    uploader.upload(destination, m_dir.filePath(QStringLiteral("missing.mp4")));
-    QCOMPARE(failed.count(), 1);
-    QVERIFY(failed.first().first().toString().startsWith(QStringLiteral("Could not read missing.mp4")));
-    QVERIFY(!uploader.busy());
+    const UploadOutcome outcome = runUpload(destination, m_dir.filePath(QStringLiteral("missing.mp4")));
+    QVERIFY(!outcome.ok);
+    QVERIFY(outcome.error.startsWith(QStringLiteral("Could not read missing.mp4")));
 }
 
 void UploaderTests::uploadCanBeCancelled() {
@@ -423,18 +540,21 @@ void UploaderTests::uploadCanBeCancelled() {
     destination.requestUrl = QStringLiteral("http://127.0.0.1:%1/").arg(silent.serverPort());
     destination.fileFormName = QStringLiteral("f");
 
-    Uploader uploader;
-    QSignalSpy failed(&uploader, &Uploader::failed);
-    QSignalSpy finished(&uploader, &Uploader::finished);
-    uploader.upload(destination, writeClip());
-    QVERIFY(uploader.busy());
+    std::unique_ptr<Job> job(sxcuJob(destination));
+    QSignalSpy failed(job.get(), &Job::failed);
+    QSignalSpy finished(job.get(), &Job::finished);
+    job->start(writeClip());
     QTRY_VERIFY(silent.hasPendingConnections());
 
-    uploader.cancel();
+    job->cancel();
     QTRY_COMPARE(failed.count(), 1);
     QCOMPARE(failed.first().first().toString(), QStringLiteral("Upload cancelled."));
     QCOMPARE(finished.count(), 0);
-    QVERIFY(!uploader.busy());
+
+    // Cancelling again, or late, doesn't report twice.
+    job->cancel();
+    QTest::qWait(50);
+    QCOMPARE(failed.count(), 1);
 }
 
 QTEST_GUILESS_MAIN(UploaderTests)

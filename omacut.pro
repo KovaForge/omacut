@@ -1,4 +1,4 @@
-QT += core gui qml quick quickcontrols2 multimedia dbus network
+QT += core gui qml quick quickcontrols2 multimedia dbus
 
 CONFIG += c++17 release
 TARGET = omacut
@@ -10,8 +10,6 @@ HEADERS += \
     src/ffmpeg.h \
     src/thumbworker.h \
     src/thumbprovider.h \
-    src/sxcu.h \
-    src/uploader.h \
     src/backend.h
 
 SOURCES += \
@@ -20,8 +18,8 @@ SOURCES += \
     src/ffmpeg.cpp \
     src/thumbworker.cpp \
     src/thumbprovider.cpp \
-    src/sxcu.cpp \
-    src/uploader.cpp \
     src/backend.cpp
 
 RESOURCES += src/resources.qrc
+
+include(src/upload/upload.pri)
