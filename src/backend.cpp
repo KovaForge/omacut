@@ -1,23 +1,28 @@
 #include "backend.h"
 
 #include <QColor>
+#include <QCoreApplication>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QPointer>
 #include <QProcess>
+#include <QTemporaryFile>
 #include <QTextStream>
+#include <QThreadPool>
+#include <QTimer>
+#include <QVariantMap>
 
 #include <cstdio>
+#include <functional>
 #include <memory>
+#include <utility>
 
 #include "filepicker.h"
 #include "portalfilepicker.h"
 #include "thumbprovider.h"
-#include "thumbworker.h"
 
 namespace {
-constexpr int kThumbCount = 12;
-constexpr int kThumbRevealMs = 70;
 const QString kDefaultAccent = QStringLiteral("#FFD60A");
 
 QString omarchyCurrentDir() {
@@ -55,8 +60,6 @@ Backend::Backend(ThumbProvider *provider, FilePicker *filePicker, QObject *paren
     if (!m_filePicker->parent())
         m_filePicker->setParent(this);
     wireFilePicker();
-    m_thumbRevealTimer.setInterval(kThumbRevealMs);
-    connect(&m_thumbRevealTimer, &QTimer::timeout, this, &Backend::revealNextThumb);
 
     // Follow omarchy theme switches live. The theme lives behind a symlink that
     // gets swapped, so the reload also re-arms the watch paths every time.
@@ -71,12 +74,21 @@ Backend::Backend(ThumbProvider *provider, FilePicker *filePicker, QObject *paren
 }
 
 Backend::~Backend() {
-    stopThumbs();
+    // Quit mid-save: the ffmpeg writing it dies with us, so its file goes too.
+    if (!m_framePart.isEmpty())
+        QFile::remove(m_framePart);
 }
 
 void Backend::wireFilePicker() {
-    connect(m_filePicker, &FilePicker::openSelected, this, &Backend::load);
-    connect(m_filePicker, &FilePicker::exportSelected, this, &Backend::exportClip);
+    connect(m_filePicker, &FilePicker::openSelected, this, [this](const QUrl &url) {
+        if (std::exchange(m_adding, false))
+            addVideo(url, m_addAt);
+        else
+            load(url);
+    });
+    connect(m_filePicker, &FilePicker::exportSelected, this, [this](const QUrl &url, int scaleHeight) {
+        exportClips(url, m_exportDialogClips, scaleHeight);
+    });
     connect(m_filePicker, &FilePicker::failed, this, &Backend::loadError);
 }
 
@@ -110,10 +122,20 @@ QString Backend::accentFromColorsFile(const QString &path, const QString &fallba
             continue;
 
         QString value = line.mid(equals + 1).trimmed();
-        if (value.size() >= 2
-                && ((value.front() == QLatin1Char('"') && value.back() == QLatin1Char('"'))
-                    || (value.front() == QLatin1Char('\'') && value.back() == QLatin1Char('\''))))
-            value = value.mid(1, value.size() - 2);
+
+        // A value can carry a trailing comment. Inside quotes the '#' belongs
+        // to the string; outside them it starts one -- except the leading '#'
+        // of a bare hex colour, which is the value itself.
+        if (value.startsWith(QLatin1Char('"')) || value.startsWith(QLatin1Char('\''))) {
+            const QChar quote = value.front();
+            const int closing = value.indexOf(quote, 1);
+            value = closing > 0 ? value.mid(1, closing - 1) : value.mid(1);
+        } else {
+            const int comment =
+                value.indexOf(QLatin1Char('#'), value.startsWith(QLatin1Char('#')) ? 1 : 0);
+            if (comment >= 0)
+                value = value.left(comment).trimmed();
+        }
 
         return QColor::fromString(value).isValid() ? value : fallback;
     }
@@ -156,49 +178,301 @@ void Backend::watchTheme() {
         m_themeWatcher.addPath(omarchyColorsPath());
 }
 
-bool Backend::load(const QUrl &url) {
-    const QString path = url.toLocalFile();
-    const ffmpeg::VideoInfo info = ffmpeg::probe(path);
-    if (!info.ok) {
-        emit loadError(info.error);
+bool Backend::isVideoPath(const QString &path) const {
+    const QString target = QFileInfo(path).canonicalFilePath();
+    for (const Video &video : m_videos) {
+        if (QFileInfo(video.info.path).canonicalFilePath() == target)
+            return true;
+    }
+    return false;
+}
+
+QVariantList Backend::videoList() const {
+    QVariantList result;
+    for (const Video &video : m_videos)
+        result.append(QVariantMap{{QStringLiteral("url"), video.url},
+                                  {QStringLiteral("thumbKey"), video.thumbKey}});
+    return result;
+}
+
+bool Backend::checkedPath(const QUrl &url, QString *path) {
+    // Only absolute local paths reach ffprobe: "file:-report" would be read
+    // as an option, and "file:http://..." as a network address.
+    *path = url.toLocalFile();
+    if (!url.isLocalFile() || !QDir::isAbsolutePath(*path)) {
+        emit loadError(QStringLiteral("Only local files can be opened."));
         return false;
     }
+    return true;
+}
 
-    m_info = info;
-    m_path = path;
-    m_source = url;
+void Backend::enqueueVideo(const PendingVideo &pending) {
+    m_probeQueue.append(pending);
+    startNextProbe();
+}
 
-    // New video: drop the old filmstrip and bump the revision so QML reloads.
-    stopThumbs();
-    m_thumbStart = 0.0;
-    m_thumbLen = m_info.duration;
-    m_fullThumbs = QVector<QImage>(kThumbCount);
-    m_fullThumbsComplete = false;
-    m_thumbCount = kThumbCount;
-    m_thumbAvailableCount = 0;
-    m_thumbReadyCount = 0;
-    m_thumbWorkerDone = false;
-    ++m_thumbRevision;
-    m_provider->setImages(QVector<QImage>(kThumbCount));
-    emit thumbsChanged();
+void Backend::startNextProbe() {
+    if (m_probing || m_probeQueue.isEmpty())
+        return;
+    const PendingVideo pending = m_probeQueue.takeFirst();
+    m_probing = true;
+    emit busyChanged();
 
-    emit infoChanged();
+    // ffprobe can take seconds on a streamed file with no header duration,
+    // so it runs on a worker thread; only applying the result needs the UI
+    // thread. The guard is only read back on the UI thread, and drops the
+    // result if this backend is already gone by then.
+    const QPointer<Backend> guard(this);
+    QThreadPool::globalInstance()->start([guard, pending] {
+        const ffmpeg::VideoInfo info = ffmpeg::probe(pending.path);
+        QMetaObject::invokeMethod(QCoreApplication::instance(), [guard, pending, info] {
+            if (guard)
+                guard->applyProbe(pending, info);
+        }, Qt::QueuedConnection);
+    });
+}
 
-    setStatus(QStringLiteral("Loading..."));
-    startThumbs();
+void Backend::applyProbe(const PendingVideo &pending, const ffmpeg::VideoInfo &info) {
+    if (!info.ok) {
+        // An export that rewrote its own source reports done either way;
+        // the reopen failing is the part the user needs explained.
+        if (pending.exportReload)
+            emit exportDone(pending.path);
+        emit loadError(pending.exportReload
+            ? QStringLiteral("Saved, but couldn't reopen it, so the clips no longer match the file.")
+            : info.error);
+        if (pending.batch)
+            ++m_batchSkipped;
+    } else {
+        Video video;
+        video.info = info;
+        video.url = pending.url;
+        video.thumbKey = ++m_nextThumbKey;
+        m_provider->setVideo(video.thumbKey, video.info.path);
+        if (pending.batch)
+            ++m_batchAdded;
+
+        if (!pending.adding || m_videos.isEmpty()) {
+            m_videos = {video};
+            m_timeline.reset(video.info.duration);
+            emit videosChanged();
+            emit infoChanged();
+        } else {
+            // A chained batch add lands after the clip the previous batch
+            // member landed on, so retarget the rest of the batch at it.
+            const int inserted = m_timeline.clipAt(pending.addAt) + 1;
+            m_videos.append(video);
+            emit videosChanged();
+            m_timeline.addSource(video.info.duration, pending.addAt);
+            if (pending.chain) {
+                const double start = m_timeline.clipStart(inserted);
+                for (PendingVideo &queued : m_probeQueue) {
+                    if (queued.batch == pending.batch)
+                        queued.addAt = start;
+                }
+            }
+        }
+        // Only now, with the saved file reopened, is the export fully
+        // done: reporting earlier let the reload erase the "Saved" notice
+        // and reset the timeline under edits made in between.
+        if (pending.exportReload)
+            emit exportDone(pending.path);
+    }
+
+    m_probing = false;
+    if (!m_probeQueue.isEmpty()) {
+        startNextProbe();
+        return;
+    }
+    emit busyChanged();
+    if (m_batchAdded > 0 && m_batchSkipped > 0)
+        emit skippedVideos(m_batchSkipped);
+    m_batchAdded = 0;
+    m_batchSkipped = 0;
+}
+
+bool Backend::load(const QUrl &url) {
+    // A running export marks its clips exported when it finishes, which
+    // must not land on a different set of videos.
+    if (busy())
+        return false;
+
+    PendingVideo pending;
+    pending.url = url;
+    pending.adding = false;
+    if (!checkedPath(url, &pending.path))
+        return false;
+    enqueueVideo(pending);
+    return true;
+}
+
+bool Backend::addVideo(const QUrl &url, double t) {
+    if (busy())
+        return false;
+    if (m_videos.isEmpty())
+        return load(url);
+
+    PendingVideo pending;
+    pending.url = url;
+    pending.adding = true;
+    pending.addAt = t;
+    if (!checkedPath(url, &pending.path))
+        return false;
+    enqueueVideo(pending);
+    return true;
+}
+
+bool Backend::addVideos(const QVariantList &urls, double t) {
+    if (busy() || urls.isEmpty())
+        return false;
+
+    const int batch = ++m_nextBatch;
+    int queued = 0;
+    for (const QVariant &value : urls) {
+        PendingVideo pending;
+        pending.url = value.toUrl();
+        pending.adding = true;
+        pending.chain = true;
+        pending.addAt = t;
+        pending.batch = batch;
+        if (!checkedPath(pending.url, &pending.path)) {
+            ++m_batchSkipped;
+            continue;
+        }
+        m_probeQueue.append(pending);
+        ++queued;
+    }
+    if (queued == 0) {
+        // Nothing probed, so nothing loaded: the per-file errors already
+        // said why, and the batch counters start clean for the next batch.
+        m_batchAdded = 0;
+        m_batchSkipped = 0;
+        return false;
+    }
+    startNextProbe();
     return true;
 }
 
 void Backend::openVideoDialog() {
+    m_adding = false;
     m_filePicker->openVideo();
 }
 
-void Backend::exportDialog(double start, double end) {
-    if (m_path.isEmpty() || !m_info.ok)
+void Backend::addVideoDialog(double t) {
+    m_adding = !m_videos.isEmpty();
+    m_addAt = t;
+    m_filePicker->openVideo();
+}
+
+void Backend::exportDialog() {
+    if (m_videos.isEmpty())
         return;
 
-    m_filePicker->exportVideo(suggestedExportUrl(), start, end,
-                              exportHeights(m_info.width, m_info.height));
+    m_exportDialogClips = m_timeline.clips();
+    const ffmpeg::VideoInfo &frame = m_videos.value(m_exportDialogClips.value(0).source).info;
+    m_filePicker->exportVideo(suggestedExportUrl(), exportHeights(frame.width, frame.height));
+}
+
+void Backend::saveFrame(double t) {
+    if (m_savingFrame || m_videos.isEmpty() || m_timeline.duration() <= 0)
+        return;
+    t = qBound(0.0, t, m_timeline.duration());
+    const int index = m_timeline.clipAt(t);
+    const edit::Clips clips = m_timeline.clips();
+    if (index < 0 || index >= clips.size())
+        return;
+    const edit::Clip clip = clips.at(index);
+    if (clip.source < 0 || clip.source >= m_videos.size())
+        return;
+    const double sourceTime = clip.in + (t - m_timeline.clipStart(index));
+    const QString path = QFileInfo(m_videos.at(clip.source).info.path).absoluteFilePath();
+    const double start = m_videos.at(clip.source).info.start;
+    const QString ffprobeBin = ffmpeg::toolPath("ffprobe");
+    const QString ffmpegBin = ffmpeg::toolPath("ffmpeg");
+    if (ffprobeBin.isEmpty() || ffmpegBin.isEmpty()) {
+        emit frameFailed(QStringLiteral("ffmpeg is not installed."));
+        return;
+    }
+
+    // In the background, as a 4K frame takes long enough to stall the
+    // window: first find the frame on screen, then write it.
+    m_savingFrame = true;
+    runFrameStep(ffprobeBin, ffmpeg::shownFrameArgs(path, start + sourceTime),
+                 [this, path, start, sourceTime, ffmpegBin](const QByteArray &packetTimes) {
+        const ffmpeg::ShownFrame shown = ffmpeg::shownFrame(packetTimes, start + sourceTime);
+        const double frameTime = shown.time - start;
+        const double keyframeTime = shown.keyframe >= 0.0 ? shown.keyframe - start : -1.0;
+        const QFileInfo source(path);
+        // Written under a hidden name, then given the first free one, so a
+        // failed or interrupted save leaves no half PNG and never replaces one.
+        QTemporaryFile part(source.absolutePath() + QStringLiteral("/.omacut-frame-XXXXXX.png"));
+        part.setAutoRemove(false);
+        if (!part.open()) {
+            m_savingFrame = false;
+            emit frameFailed(part.errorString());
+            return;
+        }
+        const QString partPath = part.fileName();
+        part.close();
+        m_framePart = partPath;
+        runFrameStep(ffmpegBin, ffmpeg::frameArgs(path, frameTime, keyframeTime, partPath),
+                     [this, source, partPath](const QByteArray &) {
+            m_savingFrame = false;
+            m_framePart.clear();
+            if (QFileInfo(partPath).size() <= 0) {
+                QFile::remove(partPath);
+                emit frameFailed(QStringLiteral("There's no frame there."));
+                return;
+            }
+            const QString stem = source.absolutePath() + QLatin1Char('/') + source.completeBaseName();
+            QString pngPath = stem + QStringLiteral("-frame.png");
+            for (int n = 2; !QFile::rename(partPath, pngPath); ++n) {
+                if (!QFileInfo::exists(pngPath) || n > 1000) {
+                    QFile::remove(partPath);
+                    emit frameFailed(QStringLiteral("Could not write %1.").arg(pngPath));
+                    return;
+                }
+                pngPath = stem + QStringLiteral("-frame-%1.png").arg(n);
+            }
+            // The temporary file was private; the frame is as shareable as any.
+            QFile::setPermissions(pngPath, QFile::ReadOwner | QFile::WriteOwner
+                                               | QFile::ReadGroup | QFile::ReadOther);
+            emit frameSaved(pngPath);
+        }, partPath);
+    });
+}
+
+void Backend::runFrameStep(const QString &program, const QStringList &args,
+                           std::function<void(const QByteArray &)> done, const QString &partPath) {
+    auto *proc = new QProcess(this);
+    // A stuck file (say, on a hung network mount) mustn't block F for good.
+    QTimer::singleShot(30000, proc, [proc] { proc->kill(); });
+    connect(proc, &QProcess::finished, this,
+            [this, proc, done, partPath](int code, QProcess::ExitStatus status) {
+        const QByteArray out = proc->readAllStandardOutput();
+        const QString err = QString::fromUtf8(proc->readAllStandardError()).trimmed();
+        proc->deleteLater();
+        if (status != QProcess::NormalExit || code != 0) {
+            m_savingFrame = false;
+            m_framePart.clear();
+            if (!partPath.isEmpty())
+                QFile::remove(partPath);
+            emit frameFailed(err.isEmpty() ? QStringLiteral("ffmpeg failed.") : err);
+            return;
+        }
+        done(out);
+    });
+    connect(proc, &QProcess::errorOccurred, this, [this, proc, partPath](QProcess::ProcessError error) {
+        if (error != QProcess::FailedToStart)
+            return;
+        m_savingFrame = false;
+        m_framePart.clear();
+        if (!partPath.isEmpty())
+            QFile::remove(partPath);
+        proc->deleteLater();
+        emit frameFailed(proc->errorString());
+    });
+    proc->start(program, args);
 }
 
 QList<int> Backend::exportHeights(int width, int height) {
@@ -211,114 +485,31 @@ QList<int> Backend::exportHeights(int width, int height) {
     return heights;
 }
 
-void Backend::startThumbs() {
-    auto *worker = new ThumbWorker(m_path, m_thumbStart, m_thumbLen, kThumbCount);
-    m_thumbWorker = worker;
-    // Pair the pointer check with the revision: a recycled worker address could
-    // otherwise let a stale queued callback write into the new filmstrip.
-    const int revision = m_thumbRevision;
-
-    connect(worker, &ThumbWorker::thumbReady, this, [this, worker, revision](int index, const QImage &image) {
-        if (worker != m_thumbWorker || revision != m_thumbRevision)
-            return;
-        m_provider->setImage(index, image);
-        // Thumbs arrive in order, so the strip is fully cached at the last one.
-        if (m_thumbStart <= 0.0 && m_thumbLen >= m_info.duration) {
-            m_fullThumbs[index] = image;
-            if (index == kThumbCount - 1)
-                m_fullThumbsComplete = true;
-        }
-        m_thumbAvailableCount = qMax(m_thumbAvailableCount, index + 1);
-        if (m_thumbReadyCount == 0)
-            revealNextThumb();
-        if (!m_thumbRevealTimer.isActive())
-            m_thumbRevealTimer.start();
-    });
-    connect(worker, &ThumbWorker::finished, this, [this, worker, revision] {
-        if (worker == m_thumbWorker && revision == m_thumbRevision) {
-            m_thumbWorker = nullptr;
-            m_thumbWorkerDone = true;
-            if (m_thumbReadyCount >= m_thumbCount)
-                setStatus(QString());
-            else if (!m_thumbRevealTimer.isActive())
-                m_thumbRevealTimer.start();
-        }
-        worker->deleteLater();
-    });
-    worker->start();
-}
-
-void Backend::revealNextThumb() {
-    if (m_thumbReadyCount < m_thumbAvailableCount) {
-        ++m_thumbReadyCount;
-        emit thumbsChanged();
-    }
-
-    if (m_thumbReadyCount < m_thumbAvailableCount)
-        return;
-
-    m_thumbRevealTimer.stop();
-    if (m_thumbWorkerDone && m_thumbReadyCount >= m_thumbCount)
-        setStatus(QString());
-}
-
-void Backend::stopThumbs() {
-    m_thumbRevealTimer.stop();
-    if (!m_thumbWorker)
-        return;
-
-    ThumbWorker *worker = m_thumbWorker;
-    m_thumbWorker = nullptr;
-    worker->disconnect(this);
-    worker->requestStop();
-    worker->wait();
-    delete worker;
-}
-
-void Backend::requestThumbs(double start, double end) {
-    if (m_path.isEmpty() || !m_info.ok)
-        return;
-    start = qBound(0.0, start, m_info.duration);
-    end = qBound(start, end, m_info.duration);
-    if (end - start <= 0.0 || (start == m_thumbStart && end - start == m_thumbLen))
-        return;
-
-    stopThumbs();
-    m_thumbStart = start;
-    m_thumbLen = end - start;
-    ++m_thumbRevision;
-
-    // Zooming back out: restore the cached full-length strip instantly.
-    if (start <= 0.0 && end >= m_info.duration && m_fullThumbsComplete) {
-        m_provider->setImages(m_fullThumbs);
-        m_thumbAvailableCount = kThumbCount;
-        m_thumbReadyCount = kThumbCount;
-        m_thumbWorkerDone = true;
-        emit thumbsChanged();
-        return;
-    }
-
-    m_thumbAvailableCount = 0;
-    m_thumbReadyCount = 0;
-    m_thumbWorkerDone = false;
-    m_provider->setImages(QVector<QImage>(kThumbCount));
-    emit thumbsChanged();
-    startThumbs();
-}
-
 QUrl Backend::suggestedExportUrl() const {
-    if (m_path.isEmpty())
+    if (m_videos.isEmpty())
         return {};
-    const QFileInfo src(m_path);
+    const QFileInfo src(m_videos.first().info.path);
     const QString target = src.dir().filePath(src.completeBaseName() + "_trimmed.mp4");
     return QUrl::fromLocalFile(target);
 }
 
-void Backend::exportClip(const QUrl &dst, double start, double end, int scaleHeight) {
-    if (m_path.isEmpty() || !m_info.ok || m_busy)
+void Backend::exportClips(const QUrl &dst, const edit::Clips &clips, int scaleHeight) {
+    if (m_videos.isEmpty() || busy())
         return;
 
-    if (end - start <= 0.0) {
+    QList<ffmpeg::Segment> segments;
+    // The first clip that still has its video sets the frame.
+    int frameSource = -1;
+    for (const edit::Clip &clip : edit::merged(clips)) {
+        if (clip.source < 0 || clip.source >= m_videos.size())
+            continue;
+        if (frameSource < 0)
+            frameSource = clip.source;
+        const ffmpeg::VideoInfo &info = m_videos[clip.source].info;
+        segments.append({info.path, clip.in, clip.out, info.audio});
+    }
+    const double clipLen = edit::duration(clips);
+    if (segments.isEmpty() || clipLen <= 0.0) {
         emit exportFailed("The selected clip has no length.");
         return;
     }
@@ -347,14 +538,14 @@ void Backend::exportClip(const QUrl &dst, double start, double end, int scaleHei
     // success, so failed/cancelled exports preserve any existing file.
     const QString tmpPath = outPath + QStringLiteral(".omacut-part.mp4");
     QFile::remove(tmpPath);
-    const QStringList args = ffmpeg::trimArgs(m_path, tmpPath, start, end, scaleHeight);
+    const ffmpeg::VideoInfo &frame = m_videos[frameSource].info;
+    const QStringList args = ffmpeg::trimArgs(segments, tmpPath, frame.width, frame.height, scaleHeight);
 
     auto *proc = new QProcess(this);
     auto completed = std::make_shared<bool>(false);
 
     // ffmpeg -progress writes key=value blocks to stdout as it encodes;
-    // out_time_us against the clip length gives the percentage.
-    const double clipLen = end - start;
+    // out_time_us against the kept length gives the percentage.
     auto progressBuf = std::make_shared<QByteArray>();
     connect(proc, &QProcess::readyReadStandardOutput, this,
             [this, proc, progressBuf, clipLen, completed] {
@@ -375,7 +566,7 @@ void Backend::exportClip(const QUrl &dst, double start, double end, int scaleHei
             });
 
     connect(proc, &QProcess::finished, this,
-            [this, proc, outPath, tmpPath, completed](int code, QProcess::ExitStatus exitStatus) {
+            [this, proc, outPath, tmpPath, completed, clips](int code, QProcess::ExitStatus exitStatus) {
                 if (*completed)
                     return;
                 *completed = true;
@@ -391,7 +582,23 @@ void Backend::exportClip(const QUrl &dst, double start, double end, int scaleHei
                 }
                 setBusy(false);
                 setStatus(QString());
-                emit exportDone(outPath);
+                // Written over one of its own videos: the clips' times point
+                // into a file that's gone, so start over from what was saved.
+                // The reopen probes in the background; if it fails, the probe
+                // result says the saved file couldn't be reopened.
+                if (!isVideoPath(outPath)) {
+                    m_timeline.markExported(clips);
+                    emit exportDone(outPath);
+                } else {
+                    // exportDone waits for the reopen probe to settle.
+                    PendingVideo pending;
+                    pending.url = QUrl::fromLocalFile(outPath);
+                    pending.exportReload = true;
+                    if (checkedPath(pending.url, &pending.path))
+                        enqueueVideo(pending);
+                    else
+                        emit exportDone(outPath);
+                }
             });
     connect(proc, &QProcess::errorOccurred, this,
             [this, proc, tmpPath, completed](QProcess::ProcessError error) {
