@@ -1,32 +1,33 @@
 #pragma once
 
 #include <QFileSystemWatcher>
-#include <QImage>
 #include <QObject>
 #include <QString>
-#include <QTimer>
 #include <QUrl>
-#include <QVector>
+#include <QVariantList>
+
+#include <functional>
 
 #include "ffmpeg.h"
+#include "timeline.h"
 
 class ThumbProvider;
 class FilePicker;
-class ThumbWorker;
 
-// The bridge between QML and the ffmpeg/ffprobe layer. Holds the currently
-// loaded video's info and drives thumbnail generation and export.
+// The bridge between QML and the ffmpeg/ffprobe layer. Holds the loaded
+// videos and the clips cut from them, and drives export.
 class Backend : public QObject {
     Q_OBJECT
+    // The first video, which names the project and sets the export's frame.
     Q_PROPERTY(QUrl source READ source NOTIFY infoChanged)
-    Q_PROPERTY(double duration READ duration NOTIFY infoChanged)
-    Q_PROPERTY(int thumbCount READ thumbCount NOTIFY thumbsChanged)
-    Q_PROPERTY(int thumbReadyCount READ thumbReadyCount NOTIFY thumbsChanged)
-    Q_PROPERTY(int thumbRevision READ thumbRevision NOTIFY thumbsChanged)
+    // Each video a clip can come from, by source index: {url, thumbKey}.
+    Q_PROPERTY(QVariantList videos READ videoList NOTIFY videosChanged)
     Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
+    Q_PROPERTY(bool probing READ probing NOTIFY busyChanged)
     Q_PROPERTY(QString status READ status NOTIFY statusChanged)
     Q_PROPERTY(QString themeAccent READ themeAccent NOTIFY themeAccentChanged)
     Q_PROPERTY(QString themeAccentForeground READ themeAccentForeground NOTIFY themeAccentChanged)
+    Q_PROPERTY(QObject *timeline READ timeline CONSTANT)
 
 public:
     explicit Backend(ThumbProvider *provider, QObject *parent = nullptr);
@@ -34,15 +35,16 @@ public:
                      QObject *parent = nullptr);
     ~Backend() override;
 
-    QUrl source() const { return m_source; }
-    double duration() const { return m_info.duration; }
-    int thumbCount() const { return m_thumbCount; }
-    int thumbReadyCount() const { return m_thumbReadyCount; }
-    int thumbRevision() const { return m_thumbRevision; }
-    bool busy() const { return m_busy; }
+    QUrl source() const { return m_videos.isEmpty() ? QUrl() : m_videos.first().url; }
+    QVariantList videoList() const;
+    // Busy while exporting or while a probe is in flight: either way the
+    // set of videos is about to change, so opening or adding must wait.
+    bool busy() const { return m_busy || m_probing; }
+    bool probing() const { return m_probing; }
     QString status() const { return m_status; }
     QString themeAccent() const { return m_themeAccent; }
     QString themeAccentForeground() const;
+    Timeline *timeline() { return &m_timeline; }
 
     // The accent from an omarchy colors.toml, or the fallback when the file is
     // missing or holds no usable accent — which is what keeps omacut working on
@@ -51,68 +53,112 @@ public:
     // "black" or "white", whichever stays legible on the given color.
     static QString foregroundFor(const QString &color);
 
-    // Load a video (probes it, then kicks off thumbnail generation).
+    // Start over with a video. Probing runs off the UI thread: false means
+    // refused outright (busy, or not an absolute local path); the outcome
+    // itself arrives via infoChanged or loadError.
     Q_INVOKABLE bool load(const QUrl &url);
+    // Add a video as a clip after the one under t, sequence seconds. Like
+    // load(), the probe finishes in the background.
+    Q_INVOKABLE bool addVideo(const QUrl &url, double t);
+    // Add several videos in order, each after the previous one lands, the
+    // way a multi-file drop should behave. Failures are skipped; once the
+    // batch settles, skippedVideos says how many, if any loaded.
+    Q_INVOKABLE bool addVideos(const QVariantList &urls, double t);
 
     // Open native desktop file dialogs.
     Q_INVOKABLE void openVideoDialog();
-    Q_INVOKABLE void exportDialog(double start, double end);
+    Q_INVOKABLE void addVideoDialog(double t);
+    // Exports the clips as they are when the dialog opens.
+    Q_INVOKABLE void exportDialog();
 
     // Suggested "<name>_trimmed.mp4" target next to the source.
     Q_INVOKABLE QUrl suggestedExportUrl() const;
+    // Saves the frame under t (seconds along the edit) as a PNG next to that
+    // clip's video, in the background. One at a time; frameSaved or
+    // frameFailed says how it went.
+    Q_INVOKABLE void saveFrame(double t);
 
-    // Write [start, end] (seconds) of the loaded video to dst. A non-zero
-    // scaleHeight downscales the shorter side to that size.
-    Q_INVOKABLE void exportClip(const QUrl &dst, double start, double end,
-                                int scaleHeight = 0);
+    // Write the clips to dst. A non-zero scaleHeight downscales the shorter
+    // side to that size.
+    void exportClips(const QUrl &dst, const edit::Clips &clips, int scaleHeight = 0);
 
     // The downscale heights worth offering for a source: only ones strictly
     // below the source's shorter side, so exports never upscale.
     static QList<int> exportHeights(int width, int height);
 
-    // Regenerate the filmstrip for [start, end] (seconds) — used by zoom.
-    // The full-length strip is cached, so zooming back out restores instantly.
-    Q_INVOKABLE void requestThumbs(double start, double end);
-
 signals:
     void infoChanged();
-    void thumbsChanged();
+    void videosChanged();
     void busyChanged();
     void statusChanged();
     void themeAccentChanged();
     void exportDone(const QString &path);
     void exportFailed(const QString &message);
+    void frameSaved(const QString &path);
+    void frameFailed(const QString &message);
     void loadError(const QString &message);
+    // An addVideos batch settled with some videos loaded and this many
+    // skipped, so the UI can summarize instead of stacking errors.
+    void skippedVideos(int count);
 
 private:
     void setBusy(bool busy);
     void setStatus(const QString &status);
     void failExport(const QString &tmpPath, const QString &message);
-    void startThumbs();
-    void stopThumbs();
-    void revealNextThumb();
     void wireFilePicker();
     void loadThemeAccent();
     void watchTheme();
 
+    struct Video {
+        ffmpeg::VideoInfo info;
+        QUrl url;
+        int thumbKey = 0;
+    };
+    // The local path behind url, or an empty string (and a loadError) when
+    // it isn't an absolute local file ffprobe can safely be handed.
+    bool checkedPath(const QUrl &url, QString *path);
+    struct PendingVideo {
+        QUrl url;
+        QString path;
+        double addAt = 0.0;
+        bool adding = false;
+        bool chain = false;
+        bool exportReload = false;
+        int batch = 0;
+    };
+    // Queues a probe and starts it if none is running. Probes run one at a
+    // time, in queue order, on a worker thread.
+    void enqueueVideo(const PendingVideo &pending);
+    void startNextProbe();
+    // Applies a finished probe on the UI thread, then starts the next one.
+    void applyProbe(const PendingVideo &pending, const ffmpeg::VideoInfo &info);
+    // One step of saving a frame: runs program, then done with its output.
+    // A failure ends the save, removing partPath if given.
+    void runFrameStep(const QString &program, const QStringList &args,
+                      std::function<void(const QByteArray &)> done,
+                      const QString &partPath = QString());
+    // Whether path is the file behind one of the loaded videos.
+    bool isVideoPath(const QString &path) const;
+
     ThumbProvider *m_provider;
     FilePicker *m_filePicker;
-    ThumbWorker *m_thumbWorker = nullptr;
-    ffmpeg::VideoInfo m_info;
-    QString m_path;
-    QUrl m_source;
-    double m_thumbStart = 0.0;
-    double m_thumbLen = 0.0;
-    QVector<QImage> m_fullThumbs;
-    bool m_fullThumbsComplete = false;
-    int m_thumbCount = 0;
-    int m_thumbAvailableCount = 0;
-    int m_thumbReadyCount = 0;
-    int m_thumbRevision = 0;
-    bool m_thumbWorkerDone = false;
+    Timeline m_timeline;
+    QList<Video> m_videos;
+    int m_nextThumbKey = 0;
+    // The open dialog adds a video at this sequence time, rather than starting over.
+    bool m_adding = false;
+    double m_addAt = 0.0;
+    edit::Clips m_exportDialogClips;
     bool m_busy = false;
+    bool m_probing = false;
+    QList<PendingVideo> m_probeQueue;
+    int m_nextBatch = 0;
+    int m_batchAdded = 0;
+    int m_batchSkipped = 0;
+    bool m_savingFrame = false;
+    // The hidden file a frame is being written to, until it's renamed.
+    QString m_framePart;
     QString m_status;
     QString m_themeAccent;
-    QTimer m_thumbRevealTimer;
     QFileSystemWatcher m_themeWatcher;
 };
