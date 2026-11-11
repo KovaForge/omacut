@@ -179,8 +179,7 @@ void PortalFilePicker::openVideo() {
     requestFile(QStringLiteral("OpenFile"), QStringLiteral("Open Video File"), options, Action::Open);
 }
 
-void PortalFilePicker::exportVideo(const QUrl &suggestedUrl, double start, double end,
-                                   const QList<int> &scaleHeights) {
+void PortalFilePicker::exportVideo(const QUrl &suggestedUrl, const QList<int> &scaleHeights) {
     const QFileInfo target(suggestedUrl.toLocalFile());
 
     QVariantMap options;
@@ -204,11 +203,8 @@ void PortalFilePicker::exportVideo(const QUrl &suggestedUrl, double start, doubl
                                                           QStringLiteral("original")}}));
     }
 
-    if (requestFile(QStringLiteral("SaveFile"), QStringLiteral("Save Video File"),
-                    options, Action::Export)) {
-        m_pendingExportStart = start;
-        m_pendingExportEnd = end;
-    }
+    requestFile(QStringLiteral("SaveFile"), QStringLiteral("Save Video File"),
+                options, Action::Export);
 }
 
 bool PortalFilePicker::connectToRequestPath(const QString &path) {
@@ -219,10 +215,24 @@ bool PortalFilePicker::connectToRequestPath(const QString &path) {
         this, SLOT(handleResponse(uint,QVariantMap)));
 }
 
-bool PortalFilePicker::requestFile(const QString &method, const QString &title,
+void PortalFilePicker::closePendingRequest() {
+    if (m_pendingPath.isEmpty())
+        return;
+    QDBusInterface request(QStringLiteral("org.freedesktop.portal.Desktop"), m_pendingPath,
+                           QStringLiteral("org.freedesktop.portal.Request"),
+                           QDBusConnection::sessionBus());
+    request.asyncCall(QStringLiteral("Close"));
+}
+
+void PortalFilePicker::requestFile(const QString &method, const QString &title,
                                    QVariantMap options, Action action) {
-    if (m_pendingAction != Action::None)
-        return false;
+    // A request whose Response never arrives (the portal crashed or was
+    // killed with the dialog up) must not wedge every later dialog behind
+    // it: close the stuck one best-effort and replace it.
+    if (m_pendingAction != Action::None) {
+        closePendingRequest();
+        clearPending();
+    }
 
     QDBusConnection bus = QDBusConnection::sessionBus();
     QDBusInterface portal(QStringLiteral("org.freedesktop.portal.Desktop"),
@@ -231,7 +241,7 @@ bool PortalFilePicker::requestFile(const QString &method, const QString &title,
                           bus);
     if (!portal.isValid()) {
         emit failed(QStringLiteral("The XDG desktop portal file chooser is not available."));
-        return false;
+        return;
     }
 
     // Subscribe to the Response signal at the request path the portal will
@@ -248,18 +258,23 @@ bool PortalFilePicker::requestFile(const QString &method, const QString &title,
     if (!connectToRequestPath(predictedPath)) {
         clearPending();
         emit failed(QStringLiteral("Could not listen for the portal file picker response."));
-        return false;
+        return;
     }
 
+    const int generation = ++m_pendingGeneration;
     auto *watcher = new QDBusPendingCallWatcher(
         portal.asyncCall(method, QString(), title, options), this);
+    m_pendingWatcher = watcher;
 
-    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, watcher]() {
+    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, watcher, generation]() {
         QDBusPendingReply<QDBusObjectPath> reply = *watcher;
         watcher->deleteLater();
+        if (m_pendingWatcher == watcher)
+            m_pendingWatcher = nullptr;
 
-        // A response may already have been handled while the reply was in flight.
-        if (m_pendingAction == Action::None)
+        // Superseded by a newer request, or a response may already have
+        // been handled while the reply was in flight.
+        if (generation != m_pendingGeneration || m_pendingAction == Action::None)
             return;
 
         if (reply.isError()) {
@@ -283,13 +298,10 @@ bool PortalFilePicker::requestFile(const QString &method, const QString &title,
             }
         }
     });
-    return true;
 }
 
 void PortalFilePicker::handleResponse(uint response, const QVariantMap &results) {
     const Action action = m_pendingAction;
-    const double start = m_pendingExportStart;
-    const double end = m_pendingExportEnd;
     clearPending();
 
     if (response != 0)
@@ -325,10 +337,16 @@ void PortalFilePicker::handleResponse(uint response, const QVariantMap &results)
         }
         arg.endArray();
     }
-    emit exportSelected(url, start, end, scaleHeight);
+    emit exportSelected(url, scaleHeight);
 }
 
 void PortalFilePicker::clearPending() {
+    // A caller that never gets its reply must not outlive the request it
+    // belonged to (repeated stuck requests would otherwise pile them up).
+    if (m_pendingWatcher) {
+        m_pendingWatcher->deleteLater();
+        m_pendingWatcher = nullptr;
+    }
     if (!m_pendingPath.isEmpty()) {
         QDBusConnection::sessionBus().disconnect(
             QStringLiteral("org.freedesktop.portal.Desktop"), m_pendingPath,

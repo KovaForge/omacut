@@ -1,22 +1,38 @@
 #pragma once
 
+#include <QCache>
+#include <QHash>
 #include <QImage>
 #include <QMutex>
-#include <QQuickImageProvider>
-#include <QVector>
+#include <QQuickAsyncImageProvider>
+#include <QThreadPool>
 
-// Serves the filmstrip thumbnails to QML. QML requests them by revision/index,
-// e.g. Image { source: "image://thumbs/7/3" }.
-class ThumbProvider : public QQuickImageProvider {
+#include <atomic>
+
+// Serves filmstrip frames to QML on demand, decoded off the UI thread and
+// cached, so a frame is extracted once however the clips are later cut or
+// moved. QML asks by video key and time in milliseconds, e.g.
+// Image { source: "image://thumbs/2/41500" }.
+class ThumbProvider : public QQuickAsyncImageProvider {
 public:
-    ThumbProvider() : QQuickImageProvider(QQuickImageProvider::Image) {}
+    ThumbProvider();
+    ~ThumbProvider() override;
 
-    void setImages(const QVector<QImage> &images);
-    void setImage(int index, const QImage &image);
+    // Keys are never reused, so a stale request can't show another video.
+    void setVideo(int key, const QString &path);
 
-    QImage requestImage(const QString &id, QSize *size, const QSize &requested) override;
+    QQuickImageResponse *requestImageResponse(const QString &id, const QSize &requestedSize) override;
+
+    // The responses fill the cache as their frames arrive.
+    QImage cached(const QString &id) const;
+    void store(const QString &id, const QImage &image);
+    // Set on the way out, to kill any ffmpeg still extracting.
+    const std::atomic<bool> *stopping() const { return &m_stopping; }
 
 private:
-    QVector<QImage> m_images;
-    QMutex m_mutex;
+    mutable QMutex m_mutex;
+    QHash<int, QString> m_paths;
+    QCache<QString, QImage> m_cache;
+    QThreadPool m_pool;
+    std::atomic<bool> m_stopping = false;
 };
