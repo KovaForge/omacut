@@ -7,10 +7,13 @@ Open a video, drag the two handles to pick a start and end, preview the clip, an
 ## What carries over from omacut
 
 - Filmstrip trim bar: two handles, a scrubbable playhead, the floating time bubble while trimming, and dimming outside the selection.
+- Several clips. `S` splits the clip under the playhead, `X` removes one, `[` `]` jump to clip edges, `Alt+[` `]` reorder, and `Ctrl+Z` undoes. Dropping more videos inserts them after the playhead. The trim bar keeps showing the clip under the playhead, and playback walks the clips. Export joins them.
 - `Z` zooms into the selection for fine-tuning. The full-length filmstrip is cached, so zooming back out is instant.
 - The same hotkeys, and the playhead stays inside the trim.
+- `F` saves the frame on screen as a PNG next to the video.
 - The opening frame shows immediately on load, never a black box.
-- Quitting asks first only when the trim hasn't been exported.
+- Opening another video, or quitting, asks first only when the edit hasn't been exported.
+- Times past an hour read `hh:mm:ss.cc`.
 - Exports are transactional: ffmpeg writes to a sibling temp file, which replaces the target only on success. Progress comes from `-progress`.
 - MP4 output with Original/1080p/720p choices, never upscaling and always keeping the aspect ratio.
 
@@ -21,7 +24,7 @@ Open a video, drag the two handles to pick a start and end, preview the clip, an
 - **Audio:** keep or remove it on export. `M` mutes playback.
 - **Frame stepping** with `,` and `.`; `I`/`O` set the trim start and end; `Home`/`End` jump to the trim edges.
 - **Cancellable export** with a progress bar.
-- **Drag and drop** a video onto the window.
+- **Drag and drop** videos onto the window. The first one opens; more are added to the edit.
 - **Host API:** `OmacutEditor.ShowAsync(options)` returns the exported path. Hosts can also pass ffmpeg paths, an accent color, a PNG watermark to burn in, a default output folder, and close-after-export.
 
 ## Playback
@@ -45,12 +48,21 @@ Anything ffmpeg can read, the editor can play. When no audio device is available
 | `Ctrl+Space` or `I` | Trim start to playhead |
 | `Alt+Space` or `O` | Trim end to playhead |
 | `Home` / `End` | Playhead to trim start / end |
+| `0`–`9` | Jump to 0%–90% of the edit |
+| `[` / `]` | Previous / next clip edge |
+| `Alt+[` / `Alt+]` | Move the clip earlier / later |
+| `S` | Split at the playhead |
+| `X` / `Delete` | Remove the clip (the last one stays) |
+| `F` | Save the frame as PNG |
 | `Z` | Zoom the selection |
 | `C` | Crop |
 | `M` | Mute |
-| `Ctrl+O` | Open a video |
+| `Ctrl+Z` | Undo |
+| `Ctrl+Shift+Z` or `Ctrl+Y` | Redo |
+| `Ctrl+O` | Open a video (asks first if the edit hasn't been exported) |
+| `Ctrl+Shift+O` | Add a video |
 | `Ctrl+S` | Export |
-| `Q` | Quit (asks first if the trim hasn't been exported) |
+| `Q` | Quit (asks first if the edit hasn't been exported) |
 | `?` | Show the hotkeys |
 
 ## Requirements

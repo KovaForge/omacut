@@ -37,11 +37,21 @@ public sealed record WatermarkOverlay(string ImagePath, double Opacity = 0.8, do
     public bool IsUsable => !string.IsNullOrWhiteSpace(ImagePath) && File.Exists(ImagePath) && Opacity > 0;
 }
 
+/// <summary>One range of one file inside a multi-clip export. Times are seconds in that file.</summary>
+public sealed record ExportSegment(string Path, double Start, double End, bool HasAudio);
+
 public sealed record ExportOptions
 {
     public required string SourcePath { get; init; }
     public required double Start { get; init; }
     public required double End { get; init; }
+
+    /// <summary>
+    /// When this holds more than one range, the export concatenates them and ignores
+    /// <see cref="Start"/> and <see cref="End"/>. One range, or none, keeps the single-span command.
+    /// </summary>
+    public IReadOnlyList<ExportSegment>? Segments { get; init; }
+
     public ExportFormat Format { get; init; } = ExportFormat.Mp4;
 
     /// <summary>Cap the shorter side to this many pixels; 0 keeps the original size. Never upscales.</summary>
@@ -54,7 +64,24 @@ public sealed record ExportOptions
     /// <summary>Frame rate for GIF exports.</summary>
     public int GifFrameRate { get; init; } = 15;
 
-    public double Length => Math.Max(End - Start, 0);
+    public double Length
+    {
+        get
+        {
+            if (Segments is { Count: > 1 } segments)
+            {
+                double total = 0;
+                foreach (ExportSegment segment in segments)
+                {
+                    total += Math.Max(segment.End - segment.Start, 0);
+                }
+
+                return total;
+            }
+
+            return Math.Max(End - Start, 0);
+        }
+    }
 }
 
 public static class ExportFormats

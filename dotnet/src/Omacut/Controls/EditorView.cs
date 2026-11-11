@@ -30,6 +30,8 @@ public sealed class EditorView : UserControl, IDisposable
     private readonly FfmpegTools _tools;
     private readonly PlaybackEngine _engine;
     private readonly TrimModel _trim = new();
+    private readonly Timeline _timeline = new();
+    private readonly List<MediaInfo> _sources = [];
     private readonly OmarchyTheme? _theme;
     private readonly DispatcherTimer _renderTimer;
     private readonly DispatcherTimer _thumbRevealTimer;
@@ -55,6 +57,9 @@ public sealed class EditorView : UserControl, IDisposable
     private readonly PillButton _quitCancel;
     private readonly PillButton _quitQuit;
     private readonly PillButton _quitExport;
+    private readonly Border _openOverlay;
+    private readonly PillButton _openKeep;
+    private readonly PillButton _openConfirm;
     private readonly Border _exportOverlay;
     private readonly StackPanel _exportOptionsPanel;
     private readonly StackPanel _exportProgressPanel;
@@ -80,6 +85,12 @@ public sealed class EditorView : UserControl, IDisposable
     private string _busyStatus = string.Empty;
     private bool _helpVisible;
     private bool _quitVisible;
+    private bool _openConfirmVisible;
+    private string? _pendingOpen;
+    private double _sequenceTime;
+    private int _shownClip;
+    private bool _applyingTimeline;
+    private bool _savingFrame;
     private bool _quitAfterExport;
     private bool _exporting;
     private CancellationTokenSource? _exportCancel;
@@ -102,7 +113,7 @@ public sealed class EditorView : UserControl, IDisposable
     private int _thumbRevision;
     private CancellationTokenSource? _thumbCancel;
 
-    private readonly record struct ExportState(double Start, double End, CropRect? Crop);
+    private readonly record struct ExportState(double Start, double End, CropRect? Crop, string Clips);
 
     public EditorView(OmacutEditorOptions? options = null)
     {
@@ -153,7 +164,7 @@ public sealed class EditorView : UserControl, IDisposable
         _openButton.Click += (_, _) => _ = OpenWithPickerAsync();
         _openHint = new TextBlock
         {
-            Text = "or drop a video here",
+            Text = "or drop videos here",
             Foreground = Palette.TextFaintBrush,
             FontSize = 13,
             HorizontalAlignment = HorizontalAlignment.Center,
@@ -256,11 +267,27 @@ public sealed class EditorView : UserControl, IDisposable
             Children =
             {
                 Heading("Unexported edit"),
-                new TextBlock { Text = "Your trim hasn't been exported. Quit anyway?", Foreground = Palette.TextSecondaryBrush, FontSize = 13, Margin = new Thickness(0, 0, 0, 12) },
+                new TextBlock { Text = "Your edit hasn't been exported. Quit anyway?", Foreground = Palette.TextSecondaryBrush, FontSize = 13, Margin = new Thickness(0, 0, 0, 12) },
                 new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10, HorizontalAlignment = HorizontalAlignment.Right, Children = { _quitCancel, _quitQuit, _quitExport } },
             },
         };
         _quitOverlay = Overlay(Card(quitContent), onScrimClick: () => SetQuitVisible(false));
+
+        _openKeep = new PillButton("Keep editing");
+        _openKeep.Click += (_, _) => SetOpenConfirmVisible(false);
+        _openConfirm = new PillButton("Open video", primary: true);
+        _openConfirm.Click += (_, _) => _ = ConfirmPendingOpenAsync();
+        var openContent = new StackPanel
+        {
+            Spacing = 8,
+            Children =
+            {
+                Heading("Unexported edit"),
+                new TextBlock { Text = "Opening another video will discard this edit. Open it anyway?", Foreground = Palette.TextSecondaryBrush, FontSize = 13, Margin = new Thickness(0, 0, 0, 12), MaxWidth = 420, TextWrapping = TextWrapping.Wrap },
+                new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10, HorizontalAlignment = HorizontalAlignment.Right, Children = { _openKeep, _openConfirm } },
+            },
+        };
+        _openOverlay = Overlay(Card(openContent), onScrimClick: () => SetOpenConfirmVisible(false));
 
         // ---- export panel ----
         _formatChoice.SelectionChanged += (_, _) => RefreshExportChoices();
@@ -325,7 +352,7 @@ public sealed class EditorView : UserControl, IDisposable
             }
         });
 
-        Content = new Panel { Children = { _layout, _helpToggle, _helpOverlay, _quitOverlay, _exportOverlay } };
+        Content = new Panel { Children = { _layout, _helpToggle, _helpOverlay, _quitOverlay, _openOverlay, _exportOverlay } };
 
         DragDrop.SetAllowDrop(this, true);
         AddHandler(DragDrop.DragOverEvent, OnDragOver);
@@ -352,11 +379,44 @@ public sealed class EditorView : UserControl, IDisposable
     internal bool IsExportPanelVisible => _exportOverlay.IsVisible;
     public string? SourcePath => _media?.Path;
 
-    /// <summary>True when the trim/crop differs from what was last exported.</summary>
+    /// <summary>True when the edit or crop differs from what was last exported.</summary>
     public bool HasUnexportedEdit =>
-        _media != null && (_trim.IsTrimmed || _surface.Crop != null) && _exported != CurrentState;
+        _media != null && _exported != CurrentState && (
+            _timeline.Unexported ||
+            TrimDiffersFromTimeline() ||
+            _surface.Crop != null ||
+            (_timeline.Clips.Count <= 1 && _trim.IsTrimmed));
 
-    private ExportState CurrentState => new(_trim.Start, _trim.End, _surface.Crop);
+    private ExportState CurrentState => new(_trim.Start, _trim.End, _surface.Crop, ClipSignature());
+
+    private string ClipSignature()
+    {
+        var parts = new string[_timeline.Clips.Count];
+        for (int i = 0; i < _timeline.Clips.Count; i++)
+        {
+            Clip clip = _timeline.Clips[i];
+            parts[i] = string.Create(CultureInfo.InvariantCulture, $"{clip.Source}:{clip.In:0.000}:{clip.Out:0.000}");
+        }
+
+        return string.Join('|', parts);
+    }
+
+    private bool TrimDiffersFromTimeline()
+    {
+        if (_timeline.Clips.Count == 0)
+        {
+            return false;
+        }
+
+        int index = _timeline.Clips.Count == 1 ? 0 : _shownClip;
+        if (index < 0 || index >= _timeline.Clips.Count)
+        {
+            return false;
+        }
+
+        Clip clip = _timeline.Clips[index];
+        return Math.Abs(clip.In - _trim.Start) > 0.0005 || Math.Abs(clip.Out - _trim.End) > 0.0005;
+    }
 
     private void Log(string message) => _options.Log?.Invoke("[omacut] " + message);
 
@@ -364,10 +424,17 @@ public sealed class EditorView : UserControl, IDisposable
     // Loading
     // =====================================================================================
 
-    public async Task<bool> OpenAsync(string path)
+    public async Task<bool> OpenAsync(string path, bool force = false)
     {
         if (_exporting)
         {
+            return false;
+        }
+
+        if (!force && _options.AllowOpeningOtherFiles && _media != null && HasUnexportedEdit && !SamePath(_media.Path, path))
+        {
+            _pendingOpen = path;
+            SetOpenConfirmVisible(true);
             return false;
         }
 
@@ -388,6 +455,13 @@ public sealed class EditorView : UserControl, IDisposable
 
         Pause();
         _media = media;
+        _sources.Clear();
+        _sources.Add(media);
+        _timeline.Reset(media.Duration);
+        _sequenceTime = 0;
+        _shownClip = 0;
+        _pendingOpen = null;
+        SetOpenConfirmVisible(false);
         _engine.Load(media);
         _trim.Reset(media.Duration);
         _surface.Clear();
@@ -428,6 +502,74 @@ public sealed class EditorView : UserControl, IDisposable
         }
     }
 
+    private async Task AddWithPickerAsync()
+    {
+        if (_topLevel?.StorageProvider is not { } storage || _exporting)
+        {
+            return;
+        }
+
+        IReadOnlyList<IStorageFile> files = await storage.OpenFilePickerAsync(new FilePickerOpenOptions
+        {
+            Title = "Add a video",
+            AllowMultiple = true,
+            FileTypeFilter =
+            [
+                new FilePickerFileType("Videos") { Patterns = ["*.mp4", "*.mkv", "*.webm", "*.mov", "*.avi", "*.m4v", "*.gif", "*.wmv", "*.flv", "*.ts"], MimeTypes = ["video/*"] },
+                FilePickerFileTypes.All,
+            ],
+        });
+
+        foreach (IStorageFile file in files)
+        {
+            if (file.TryGetLocalPath() is { } path)
+            {
+                await AddVideoAsync(path);
+            }
+        }
+    }
+
+    private async Task<bool> AddVideoAsync(string path)
+    {
+        if (_exporting)
+        {
+            return false;
+        }
+
+        if (_media == null)
+        {
+            return await OpenAsync(path);
+        }
+
+        MediaInfo media;
+        try
+        {
+            media = await MediaProbe.ProbeAsync(_tools, path);
+        }
+        catch (MediaProbeException ex)
+        {
+            ShowNotice("Cannot open video: " + ex.Message);
+            Log($"Probe failed for {path}: {ex.Message}");
+            return false;
+        }
+
+        _sources.Add(media);
+        _timeline.AddSource(media.Duration, CurrentSequenceTime());
+        ShowNotice("Added " + Path.GetFileName(path));
+        UpdateStatus();
+        return true;
+    }
+
+    private async Task ConfirmPendingOpenAsync()
+    {
+        string? path = _pendingOpen;
+        SetOpenConfirmVisible(false);
+        if (!string.IsNullOrEmpty(path))
+        {
+            await OpenAsync(path, force: true);
+        }
+    }
+
     private void OnDragOver(object? sender, DragEventArgs e)
     {
         e.DragEffects = !_exporting && _options.AllowOpeningOtherFiles && e.DataTransfer.Formats.Contains(DataFormat.File)
@@ -442,13 +584,55 @@ public sealed class EditorView : UserControl, IDisposable
             return;
         }
 
+        var paths = new List<string>();
         foreach (IDataTransferItem item in e.DataTransfer.Items)
         {
             if (item.TryGetRaw(DataFormat.File) is IStorageFile file && file.TryGetLocalPath() is { } path)
             {
-                _ = OpenAsync(path);
-                break;
+                paths.Add(path);
             }
+        }
+
+        if (paths.Count > 0)
+        {
+            _ = AddDroppedAsync(paths);
+        }
+    }
+
+    private async Task AddDroppedAsync(List<string> paths)
+    {
+        if (_media == null)
+        {
+            int openedAt = -1;
+            for (int i = 0; i < paths.Count; i++)
+            {
+                if (await OpenAsync(paths[i]))
+                {
+                    openedAt = i;
+                    break;
+                }
+            }
+
+            if (_media == null || openedAt < 0)
+            {
+                return;
+            }
+
+            paths = paths.GetRange(openedAt + 1, paths.Count - openedAt - 1);
+        }
+
+        int failed = 0;
+        foreach (string path in paths)
+        {
+            if (!await AddVideoAsync(path))
+            {
+                failed++;
+            }
+        }
+
+        if (failed > 0)
+        {
+            ShowNotice(failed == paths.Count ? "Cannot open those videos." : $"Skipped {failed} video{(failed == 1 ? "" : "s")}.");
         }
     }
 
@@ -471,6 +655,18 @@ public sealed class EditorView : UserControl, IDisposable
             return;
         }
 
+        if (_timeline.Clips.Count > 1)
+        {
+            double sequence = _sequenceTime;
+            if (sequence >= _timeline.Duration - 0.01)
+            {
+                sequence = 0;
+            }
+
+            PlaySequenceFrom(sequence);
+            return;
+        }
+
         // A finished clip rests a hair before the end; treat anything within 10 ms of the end as
         // "at the end" so play restarts from the trim start instead of instantly re-pausing.
         double from = _trim.Playhead;
@@ -481,6 +677,20 @@ public sealed class EditorView : UserControl, IDisposable
         }
 
         _engine.Play(from, _trim.End);
+        _renderTimer.Start();
+        UpdateChrome();
+    }
+
+    private void PlaySequenceFrom(double sequenceTime)
+    {
+        ShowClipAt(sequenceTime, showFrame: false);
+        if (_media == null || _shownClip < 0 || _shownClip >= _timeline.Clips.Count)
+        {
+            return;
+        }
+
+        Clip clip = _timeline.Clips[_shownClip];
+        _engine.Play(Math.Clamp(_trim.Playhead, clip.In, clip.Out), clip.Out);
         _renderTimer.Start();
         UpdateChrome();
     }
@@ -521,11 +731,18 @@ public sealed class EditorView : UserControl, IDisposable
         if (!_trimBar.IsInteracting)
         {
             _trim.SetPlayhead(_engine.Position);
+            RememberSequenceTime();
             UpdateStatus();
         }
 
         if (ended)
         {
+            if (_timeline.Clips.Count > 1 && _shownClip + 1 < _timeline.Clips.Count)
+            {
+                PlaySequenceFrom(_timeline.ClipStart(_shownClip + 1));
+                return;
+            }
+
             // Stop at the trim end, like a clip preview.
             _engine.Pause();
             _renderTimer.Stop();
@@ -537,6 +754,7 @@ public sealed class EditorView : UserControl, IDisposable
     private void MovePlayheadTo(double seconds)
     {
         _trim.SetPlayhead(seconds);
+        RememberSequenceTime();
         if (IsPlaying)
         {
             _engine.Play(_trim.Playhead, _trim.End);
@@ -616,13 +834,20 @@ public sealed class EditorView : UserControl, IDisposable
         if (active)
         {
             // Dragging takes over the picture; resume afterwards if it was playing.
+            // The whole drag is one undo step.
             _resumeAfterScrub = IsPlaying;
             Pause();
+            _timeline.BeginGesture();
         }
-        else if (_resumeAfterScrub)
+        else
         {
-            _resumeAfterScrub = false;
-            TogglePlay();
+            SyncClipFromTrim();
+            _timeline.EndGesture();
+            if (_resumeAfterScrub)
+            {
+                _resumeAfterScrub = false;
+                TogglePlay();
+            }
         }
 
         UpdateStatus();
@@ -652,6 +877,7 @@ public sealed class EditorView : UserControl, IDisposable
 
         _trim.MoveStartTo(seconds);
         MovePlayheadTo(_trim.Start);
+        SyncClipFromTrim();
     }
 
     private void MoveTrimEndTo(double seconds)
@@ -663,6 +889,7 @@ public sealed class EditorView : UserControl, IDisposable
 
         _trim.MoveEndTo(seconds);
         MovePlayheadTo(_trim.End);
+        SyncClipFromTrim();
     }
 
     private void ToggleZoom()
@@ -975,7 +1202,12 @@ public sealed class EditorView : UserControl, IDisposable
 
         _exportPathText.Text = _exportPath;
         ToolTip.SetTip(_exportPathText, _exportPath);
-        var parts = new List<string> { $"{TimeFormat.Format(_trim.Length)} clip" };
+        double shownLength = _timeline.Clips.Count > 1 ? _timeline.Duration : _trim.Length;
+        var parts = new List<string> { $"{TimeFormat.Format(shownLength)} clip" };
+        if (_timeline.Clips.Count > 1)
+        {
+            parts.Add($"{_timeline.Clips.Count} clips");
+        }
         if (_surface.Crop is CropRect crop)
         {
             parts.Add($"crop {crop.Width}×{crop.Height}");
@@ -1039,18 +1271,17 @@ public sealed class EditorView : UserControl, IDisposable
             return;
         }
 
-        var options = new ExportOptions
+        ExportOptions options = BuildExportOptions(media);
+        MediaInfo exportInfo = media;
+        if (_timeline.Clips.Count > 1)
         {
-            SourcePath = media.Path,
-            Start = _trim.Start,
-            End = _trim.End,
-            Format = _formatChoice.Selected,
-            ShortSide = _sizeChoice.Selected,
-            IncludeAudio = _audioChoice.Selected,
-            Crop = _surface.Crop,
-            Watermark = _options.Watermark,
-        };
-        ExportState state = CurrentState;
+            List<Clip> merged = Edit.Merged(_timeline.Clips);
+            if (merged.Count > 0 && merged[0].Source >= 0 && merged[0].Source < _sources.Count)
+            {
+                exportInfo = _sources[merged[0].Source];
+            }
+        }
+
         _lastFormat = options.Format;
 
         _exporting = true;
@@ -1071,8 +1302,9 @@ public sealed class EditorView : UserControl, IDisposable
         try
         {
             var service = new ExportService(_tools, await _encoders);
-            string written = await service.ExportAsync(options, media, _exportPath, progress, _exportCancel.Token);
-            _exported = state;
+            string written = await service.ExportAsync(options, exportInfo, _exportPath, progress, _exportCancel.Token);
+            _timeline.MarkExported(_timeline.Clips.ToList());
+            _exported = CurrentState;
             LastExportedPath = written;
             _exportPath = null;
             _exporting = false;
@@ -1188,10 +1420,362 @@ public sealed class EditorView : UserControl, IDisposable
         }
     }
 
+    private void SetOpenConfirmVisible(bool visible)
+    {
+        if (!visible)
+        {
+            _pendingOpen = null;
+        }
+
+        _openConfirmVisible = visible;
+        _openOverlay.IsVisible = visible;
+        if (visible)
+        {
+            Pause();
+            _openKeep.Focus();
+        }
+        else
+        {
+            Focus();
+        }
+    }
+
+    private void MoveOpenFocus(int direction)
+    {
+        PillButton[] order = [_openKeep, _openConfirm];
+        int index = Array.IndexOf(order, FocusedPill());
+        order[((index < 0 ? 0 : index) + direction + order.Length) % order.Length].Focus();
+    }
+
     private void SetHelpVisible(bool visible)
     {
         _helpVisible = visible;
         _helpOverlay.IsVisible = visible;
+    }
+
+    private ExportOptions BuildExportOptions(MediaInfo media)
+    {
+        ExportFormat format = _formatChoice.Selected;
+        int shortSide = _sizeChoice.Selected;
+        bool includeAudio = _audioChoice.Selected;
+        CropRect? crop = _surface.Crop;
+        WatermarkOverlay? watermark = _options.Watermark;
+        if (_timeline.Clips.Count > 1)
+        {
+            List<Clip> merged = Edit.Merged(_timeline.Clips);
+            if (merged.Count == 1 && (uint)merged[0].Source < (uint)_sources.Count)
+            {
+                Clip clip = merged[0];
+                MediaInfo source = _sources[clip.Source];
+                return new ExportOptions
+                {
+                    SourcePath = source.Path,
+                    Start = clip.In,
+                    End = clip.Out,
+                    Format = format,
+                    ShortSide = shortSide,
+                    IncludeAudio = includeAudio,
+                    Crop = crop,
+                    Watermark = watermark,
+                };
+            }
+
+            if (merged.Count > 1)
+            {
+                var segments = new List<ExportSegment>(merged.Count);
+                foreach (Clip clip in merged)
+                {
+                    if ((uint)clip.Source >= (uint)_sources.Count)
+                    {
+                        continue;
+                    }
+
+                    MediaInfo source = _sources[clip.Source];
+                    segments.Add(new ExportSegment(source.Path, clip.In, clip.Out, source.HasAudio));
+                }
+
+                if (segments.Count > 1)
+                {
+                    return new ExportOptions
+                    {
+                        SourcePath = segments[0].Path,
+                        Start = segments[0].Start,
+                        End = segments[0].End,
+                        Segments = segments,
+                        Format = format,
+                        ShortSide = shortSide,
+                        IncludeAudio = includeAudio,
+                        Crop = crop,
+                        Watermark = watermark,
+                    };
+                }
+            }
+        }
+
+        return new ExportOptions
+        {
+            SourcePath = media.Path,
+            Start = _trim.Start,
+            End = _trim.End,
+            Format = format,
+            ShortSide = shortSide,
+            IncludeAudio = includeAudio,
+            Crop = crop,
+            Watermark = watermark,
+        };
+    }
+
+    private void RememberSequenceTime()
+    {
+        if (_applyingTimeline || _timeline.Clips.Count == 0)
+        {
+            return;
+        }
+
+        int index = _timeline.Clips.Count == 1 ? 0 : _shownClip;
+        if ((uint)index >= (uint)_timeline.Clips.Count)
+        {
+            return;
+        }
+
+        Clip clip = _timeline.Clips[index];
+        _sequenceTime = _timeline.ClipStart(index) + Math.Clamp(_trim.Playhead - clip.In, 0, Math.Max(clip.Length, 0));
+    }
+
+    private double CurrentSequenceTime()
+    {
+        if (_timeline.Clips.Count <= 1)
+        {
+            double origin = _timeline.Clips.Count == 1 ? _timeline.Clips[0].In : 0;
+            return Math.Max(0, _trim.Playhead - origin);
+        }
+
+        return _sequenceTime;
+    }
+
+    private void SyncClipFromTrim()
+    {
+        if (_applyingTimeline || _timeline.Clips.Count == 0 || _media == null)
+        {
+            return;
+        }
+
+        int index = _timeline.Clips.Count == 1 ? 0 : _shownClip;
+        if ((uint)index >= (uint)_timeline.Clips.Count)
+        {
+            return;
+        }
+
+        Clip clip = _timeline.Clips[index];
+        if (Math.Abs(clip.In - _trim.Start) < 1e-9 && Math.Abs(clip.Out - _trim.End) < 1e-9)
+        {
+            return;
+        }
+
+        _timeline.SetClip(index, _trim.Start, _trim.End);
+        if ((uint)index >= (uint)_timeline.Clips.Count)
+        {
+            return;
+        }
+
+        Clip updated = _timeline.Clips[index];
+        _sequenceTime = _timeline.ClipStart(index) + Math.Clamp(_trim.Playhead - updated.In, 0, Math.Max(updated.Length, 0));
+    }
+
+    /// <summary>Shows the clip under a sequence time on the trim bar. The filmstrip stays that clip's source.</summary>
+    private void ShowClipAt(double sequenceTime, bool showFrame = true)
+    {
+        if (_timeline.Clips.Count == 0 || _sources.Count == 0)
+        {
+            return;
+        }
+
+        sequenceTime = Math.Clamp(sequenceTime, 0, Math.Max(_timeline.Duration, 0));
+        int index = _timeline.ClipAt(sequenceTime);
+        if ((uint)index >= (uint)_timeline.Clips.Count || (uint)_timeline.Clips[index].Source >= (uint)_sources.Count)
+        {
+            return;
+        }
+
+        Clip clip = _timeline.Clips[index];
+        MediaInfo source = _sources[clip.Source];
+        double sourceTime = Math.Clamp(clip.In + (sequenceTime - _timeline.ClipStart(index)), clip.In, clip.Out);
+        bool switched = _media == null || !string.Equals(_media.Path, source.Path, StringComparison.Ordinal);
+        bool zoomed = _trim.Zoomed;
+
+        _applyingTimeline = true;
+        try
+        {
+            _media = source;
+            _shownClip = index;
+            if (switched)
+            {
+                Pause();
+                _engine.Load(source);
+                _surface.Clear();
+                _surface.SetSource(source.Width, source.Height);
+                TitleChanged?.Invoke(this, Path.GetFileName(source.Path));
+            }
+
+            if (switched || zoomed)
+            {
+                StartThumbs(0, source.Duration, resetCache: true);
+            }
+
+            _trim.Reset(source.Duration);
+            _trim.MoveStartTo(clip.In);
+            _trim.MoveEndTo(clip.Out);
+            _trim.SetPlayhead(sourceTime);
+            _sequenceTime = _timeline.ClipStart(index) + Math.Clamp(sourceTime - clip.In, 0, Math.Max(clip.Length, 0));
+        }
+        finally
+        {
+            _applyingTimeline = false;
+        }
+
+        if (showFrame && !IsPlaying)
+        {
+            RequestFrame(sourceTime);
+        }
+
+        UpdateChrome();
+    }
+
+    private void SplitAtPlayhead()
+    {
+        if (_media == null || _surface.IsEditingCrop)
+        {
+            return;
+        }
+
+        SyncClipFromTrim();
+        double at = CurrentSequenceTime();
+        int before = _timeline.Clips.Count;
+        _timeline.Split(at);
+        if (_timeline.Clips.Count != before)
+        {
+            ShowClipAt(at);
+        }
+    }
+
+    private void RemoveAtPlayhead()
+    {
+        if (_media == null || _surface.IsEditingCrop || _timeline.Clips.Count < 2)
+        {
+            return;
+        }
+
+        double at = CurrentSequenceTime();
+        _timeline.RemoveAt(at);
+        ShowClipAt(Math.Min(at, _timeline.Duration));
+    }
+
+    private void MoveShownClip(int direction)
+    {
+        if (_timeline.Clips.Count < 2)
+        {
+            return;
+        }
+
+        int from = _timeline.ClipAt(CurrentSequenceTime());
+        int to = from + direction;
+        if (from < 0 || to < 0 || to >= _timeline.Clips.Count)
+        {
+            return;
+        }
+
+        _timeline.MoveClip(from, to);
+        ShowClipAt(_timeline.ClipStart(to));
+    }
+
+    private void UndoEdit()
+    {
+        if (!_timeline.CanUndo)
+        {
+            return;
+        }
+
+        _timeline.Undo();
+        ShowClipAt(Math.Clamp(_sequenceTime, 0, _timeline.Duration));
+    }
+
+    private void RedoEdit()
+    {
+        if (!_timeline.CanRedo)
+        {
+            return;
+        }
+
+        _timeline.Redo();
+        ShowClipAt(Math.Clamp(_sequenceTime, 0, _timeline.Duration));
+    }
+
+    private void SeekSequence(double sequenceTime)
+    {
+        if (_timeline.Duration <= 0)
+        {
+            return;
+        }
+
+        sequenceTime = Math.Clamp(sequenceTime, 0, _timeline.Duration);
+        if (_timeline.Clips.Count <= 1)
+        {
+            double origin = _timeline.Clips.Count == 1 ? _timeline.Clips[0].In : _trim.Start;
+            MovePlayheadTo(origin + sequenceTime);
+            return;
+        }
+
+        Pause();
+        ShowClipAt(sequenceTime);
+    }
+
+    private async Task SaveFrameAsync()
+    {
+        if (_media == null || _savingFrame || _exporting)
+        {
+            return;
+        }
+
+        if (!_tools.HasFfmpeg)
+        {
+            ShowNotice("ffmpeg was not found.");
+            return;
+        }
+
+        _savingFrame = true;
+        string path = FrameExport.NextPath(_media.Path);
+        try
+        {
+            ToolResult result = await FfmpegTools.RunAsync(
+                _tools.FfmpegPath,
+                FrameExport.Arguments(_media.Path, _trim.Playhead, path),
+                TimeSpan.FromSeconds(30));
+            ShowNotice(result.Succeeded ? "Saved " + Path.GetFileName(path) : "Could not save that frame.");
+        }
+        catch (Exception ex) when (ex is IOException or System.ComponentModel.Win32Exception or InvalidOperationException)
+        {
+            ShowNotice("Could not save that frame.");
+            Log("Frame save failed: " + ex.Message);
+        }
+        finally
+        {
+            _savingFrame = false;
+        }
+    }
+
+    private static bool SamePath(string left, string right)
+    {
+        try
+        {
+            return string.Equals(
+                Path.GetFullPath(left),
+                Path.GetFullPath(right),
+                OperatingSystem.IsLinux() ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;
+        }
     }
 
     // =====================================================================================
@@ -1265,9 +1849,29 @@ public sealed class EditorView : UserControl, IDisposable
             return;
         }
 
-        if (_helpVisible && (e.Key == Key.Escape || symbol == "?"))
+        if (_openConfirmVisible)
         {
-            SetHelpVisible(false);
+            if (e.Key == Key.Escape)
+            {
+                SetOpenConfirmVisible(false);
+                e.Handled = true;
+            }
+            else if (e.Key is Key.Left or Key.Right)
+            {
+                MoveOpenFocus(e.Key == Key.Right ? 1 : -1);
+                e.Handled = true;
+            }
+
+            return;
+        }
+
+        if (_helpVisible)
+        {
+            if (e.Key == Key.Escape || symbol == "?")
+            {
+                SetHelpVisible(false);
+            }
+
             e.Handled = true;
             return;
         }
@@ -1316,6 +1920,13 @@ public sealed class EditorView : UserControl, IDisposable
             case Key.I when !ctrl:
                 MoveTrimStartTo(_trim.Playhead);
                 break;
+            case Key.O when ctrl && shift:
+                if (_options.AllowOpeningOtherFiles)
+                {
+                    _ = AddWithPickerAsync();
+                }
+
+                break;
             case Key.O when ctrl:
                 if (_options.AllowOpeningOtherFiles)
                 {
@@ -1338,7 +1949,14 @@ public sealed class EditorView : UserControl, IDisposable
             case Key.End:
                 MovePlayheadTo(_trim.End);
                 break;
-            case Key.Z when !ctrl:
+            case Key.Z when ctrl && shift:
+            case Key.Y when ctrl:
+                RedoEdit();
+                break;
+            case Key.Z when ctrl:
+                UndoEdit();
+                break;
+            case Key.Z:
                 ToggleZoom();
                 break;
             case Key.C when !ctrl:
@@ -1351,15 +1969,23 @@ public sealed class EditorView : UserControl, IDisposable
             case Key.E when ctrl:
                 ShowExport();
                 break;
+            case Key.S:
+                SplitAtPlayhead();
+                break;
+            case Key.X when !ctrl:
+            case Key.Delete:
+            case Key.Back:
+                RemoveAtPlayhead();
+                break;
+            case Key.F when !ctrl:
+                _ = SaveFrameAsync();
+                break;
             case Key.Q when !ctrl:
                 if (RequestClose())
                 {
                     CloseRequested?.Invoke(this, EventArgs.Empty);
                 }
 
-                break;
-            case Key.Escape when _helpVisible:
-                SetHelpVisible(false);
                 break;
             default:
                 handled = false;
@@ -1377,6 +2003,27 @@ public sealed class EditorView : UserControl, IDisposable
                 case ".":
                     StepFrame(1);
                     handled = true;
+                    break;
+                case "[" or "]":
+                    if (alt)
+                    {
+                        MoveShownClip(symbol == "]" ? 1 : -1);
+                    }
+                    else
+                    {
+                        Pause();
+                        SeekSequence(_timeline.EdgeFrom(CurrentSequenceTime(), symbol == "]" ? 1 : -1));
+                    }
+
+                    handled = true;
+                    break;
+                default:
+                    if (!ctrl && !alt && symbol.Length == 1 && symbol[0] is >= '0' and <= '9')
+                    {
+                        SeekSequence(_timeline.Duration * (symbol[0] - '0') / 10.0);
+                        handled = true;
+                    }
+
                     break;
             }
         }
@@ -1460,8 +2107,16 @@ public sealed class EditorView : UserControl, IDisposable
         _status.Foreground = Palette.TextSecondaryBrush;
         var inlines = new InlineCollection
         {
-            new Run(TimeFormat.Format(_trim.Playhead) + " (" + TimeFormat.Format(_trim.Length) + ")"),
+            new Run((_timeline.Clips.Count > 1 ? TimeFormat.Format(_sequenceTime) : TimeFormat.Format(_trim.Playhead))
+                + " (" + (_timeline.Clips.Count > 1 ? TimeFormat.Format(_timeline.Duration) : TimeFormat.Format(_trim.Length)) + ")"),
         };
+
+        if (_timeline.Clips.Count > 1)
+        {
+            int index = Math.Clamp(_shownClip, 0, _timeline.Clips.Count - 1);
+            inlines.Add(new Run(" · "));
+            inlines.Add(new Run($"clip {index + 1}/{_timeline.Clips.Count}") { Foreground = new ImmutableSolidColorBrush(_accent) });
+        }
 
         var accentBrush = new ImmutableSolidColorBrush(_accent);
         if (_trim.Zoomed)
@@ -1505,7 +2160,7 @@ public sealed class EditorView : UserControl, IDisposable
             button.AccentForeground = _accentForeground;
         }
 
-        foreach (PillButton pill in new[] { _openButton, _quitCancel, _quitQuit, _quitExport, _exportGo, _exportCancelButton, _exportChange, _progressCancel })
+        foreach (PillButton pill in new[] { _openButton, _quitCancel, _quitQuit, _quitExport, _openKeep, _openConfirm, _exportGo, _exportCancelButton, _exportChange, _progressCancel })
         {
             pill.Accent = _accent;
             pill.AccentForeground = _accentForeground;
@@ -1533,10 +2188,19 @@ public sealed class EditorView : UserControl, IDisposable
             ("Ctrl Space  or  I", "Trim start to playhead"),
             ("Alt Space  or  O", "Trim end to playhead"),
             ("Home / End", "Playhead to trim start / end"),
+            ("0 – 9", "Jump to 0% – 90%"),
+            ("[ / ]", "Previous / next clip edge"),
+            ("Alt [ / ]", "Move the clip"),
+            ("S", "Split at the playhead"),
+            ("X / Delete", "Remove the clip"),
+            ("F", "Save the frame"),
             ("Z", "Zoom the selection"),
             ("C", "Crop (Enter apply, Esc cancel)"),
             ("M", "Mute"),
+            ("Ctrl Z", "Undo"),
+            ("Ctrl Shift Z", "Redo"),
             ("Ctrl O", "Open a video"),
+            ("Ctrl Shift O", "Add a video"),
             ("Ctrl S", "Export"),
             ("Q", "Quit"),
             ("?", "Show these shortcuts"),
@@ -1553,7 +2217,7 @@ public sealed class EditorView : UserControl, IDisposable
                 Spacing = 18,
                 Children =
                 {
-                    new TextBlock { Text = keys, Width = 150, TextAlignment = TextAlignment.Right, Foreground = accent, FontSize = 13, FontFamily = Palette.Mono },
+                    new TextBlock { Text = keys, Width = 168, TextAlignment = TextAlignment.Right, Foreground = accent, FontSize = 13, FontFamily = Palette.Mono },
                     new TextBlock { Text = action, Foreground = Palette.TextSecondaryBrush, FontSize = 13 },
                 },
             });

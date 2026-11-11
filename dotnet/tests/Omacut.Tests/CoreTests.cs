@@ -10,7 +10,7 @@ public class TimeFormatTests
     [TestCase(5.25, "00:05.25")]
     [TestCase(59.999, "01:00.00")]
     [TestCase(61.5, "01:01.50")]
-    [TestCase(3725.01, "62:05.01")]
+    [TestCase(3725.01, "01:02:05.01")]
     [TestCase(-3, "00:00.00")]
     [TestCase(double.NaN, "00:00.00")]
     public void FormatsLikeOmacut(double seconds, string expected) =>
@@ -265,6 +265,248 @@ public class ExportArgumentTests
         Assert.That(fraction, Is.EqualTo(0.5));
         Assert.That(ExportService.TryParseProgress("out_time_us=N/A", 5, out _), Is.False);
         Assert.That(ExportService.TryParseProgress("frame=10", 5, out _), Is.False);
+    }
+
+    [Test]
+    public void OneSegmentStaysASingleSpan()
+    {
+        List<string> args = Build(new ExportOptions
+        {
+            SourcePath = Video.Path,
+            Start = 2.5,
+            End = 7.25,
+            Segments = [new ExportSegment(Video.Path, 1, 2, true)],
+        });
+        Assert.That(After(args, "-ss"), Is.EqualTo("2.500"));
+        Assert.That(args, Does.Not.Contain("concat"));
+    }
+
+    [Test]
+    public void JoinsRangesOfOneVideo()
+    {
+        List<string> args = Build(new ExportOptions
+        {
+            SourcePath = Video.Path,
+            Start = 0,
+            End = 1,
+            Segments =
+            [
+                new ExportSegment(Video.Path, 0, 1, true),
+                new ExportSegment(Video.Path, 2, 3.5, true),
+            ],
+        });
+        Assert.That(args.Count(arg => arg == "-i"), Is.EqualTo(2));
+        Assert.That(After(args, "-filter_complex"), Is.EqualTo(
+            "[0:V:0][0:a:0][1:V:0][1:a:0]concat=n=2:v=1:a=1[joined][a];[joined]crop=trunc(iw/2)*2:trunc(ih/2)*2:0:0[vout]"));
+        Assert.That(After(args, "-map"), Is.EqualTo("[vout]"));
+        Assert.That(args, Does.Contain("[a]"));
+        Assert.That(After(args, "-c:a"), Is.EqualTo("aac"));
+
+        List<string> silent = Build(new ExportOptions
+        {
+            SourcePath = Video.Path,
+            Start = 0,
+            End = 1,
+            IncludeAudio = false,
+            Segments =
+            [
+                new ExportSegment(Video.Path, 0, 1, false),
+                new ExportSegment(Video.Path, 2, 3.5, false),
+            ],
+        });
+        Assert.That(After(silent, "-filter_complex"), Is.EqualTo(
+            "[0:V:0][1:V:0]concat=n=2:v=1:a=0[joined];[joined]crop=trunc(iw/2)*2:trunc(ih/2)*2:0:0[vout]"));
+        Assert.That(silent, Does.Contain("-an"));
+    }
+
+    [Test]
+    public void FitsDifferentVideosTogether()
+    {
+        List<string> args = Build(new ExportOptions
+        {
+            SourcePath = "a.mp4",
+            Start = 0,
+            End = 1,
+            Segments =
+            [
+                new ExportSegment("a.mp4", 0, 1, true),
+                new ExportSegment("b.mp4", 3, 5, false),
+            ],
+        }, Video with { Width = 1921, Height = 1080 });
+        Assert.That(After(args, "-filter_complex"), Is.EqualTo(
+            "[0:V:0]scale='trunc(iw*sar/2)*2':ih,setsar=1,scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:-1:-1,setsar=1,format=yuv420p[v0];"
+            + "[0:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a0];"
+            + "[1:V:0]scale='trunc(iw*sar/2)*2':ih,setsar=1,scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:-1:-1,setsar=1,format=yuv420p[v1];"
+            + "anullsrc=r=48000:cl=stereo,atrim=duration=2.000,aformat=sample_fmts=fltp[a1];"
+            + "[v0][a0][v1][a1]concat=n=2:v=1:a=1[joined][a];[joined]null[vout]"));
+    }
+}
+
+public class TimelineTests
+{
+    [Test]
+    public void SplitsTrimsAndJoins()
+    {
+        var timeline = new Timeline();
+        timeline.Reset(10);
+        Assert.That(timeline.Clips, Is.EqualTo(new[] { new Clip(0, 0, 10) }));
+
+        timeline.Split(4);
+        Assert.That(timeline.Clips, Is.EqualTo(new[] { new Clip(0, 0, 4), new Clip(0, 4, 10) }));
+        Assert.That(timeline.CanJoin(0), Is.True);
+        timeline.Split(4.05);
+        Assert.That(timeline.Clips, Has.Count.EqualTo(2));
+
+        timeline.SetClip(1, 6, 10);
+        Assert.That(timeline.Clips, Is.EqualTo(new[] { new Clip(0, 0, 4), new Clip(0, 6, 10) }));
+        Assert.That(timeline.Duration, Is.EqualTo(8));
+        Assert.That(timeline.CanJoin(0), Is.False);
+        timeline.SetClip(1, 2, 12);
+        Assert.That(timeline.Clips, Is.EqualTo(new[] { new Clip(0, 0, 4), new Clip(0, 2, 10) }));
+
+        timeline.JoinClips(0);
+        Assert.That(timeline.Clips, Has.Count.EqualTo(2));
+        timeline.SetClip(1, 4, 10);
+        timeline.JoinClips(0);
+        Assert.That(timeline.Clips, Is.EqualTo(new[] { new Clip(0, 0, 10) }));
+        timeline.RemoveClip(0);
+        Assert.That(timeline.Clips, Is.EqualTo(new[] { new Clip(0, 0, 10) }));
+
+        timeline.Split(5);
+        Assert.That(Edit.Merged(timeline.Clips), Is.EqualTo(new[] { new Clip(0, 0, 10) }));
+    }
+
+    [Test]
+    public void AddsAndMovesVideos()
+    {
+        var timeline = new Timeline();
+        timeline.Reset(10);
+        timeline.Split(5);
+        Assert.That(timeline.AddSource(3, 2), Is.EqualTo(1));
+        Assert.That(timeline.Clips, Is.EqualTo(new[] { new Clip(0, 0, 5), new Clip(1, 0, 3), new Clip(0, 5, 10) }));
+        Assert.That(timeline.Duration, Is.EqualTo(13));
+        Assert.That(timeline.Unexported, Is.True);
+        Assert.That(timeline.CanJoin(0), Is.False);
+        Assert.That(timeline.CanJoin(1), Is.False);
+
+        timeline.MoveClip(1, 2);
+        Assert.That(timeline.Clips, Is.EqualTo(new[] { new Clip(0, 0, 5), new Clip(0, 5, 10), new Clip(1, 0, 3) }));
+        Assert.That(Edit.Merged(timeline.Clips), Is.EqualTo(new[] { new Clip(0, 0, 10), new Clip(1, 0, 3) }));
+        timeline.MoveClip(2, 5);
+        Assert.That(timeline.Clips, Has.Count.EqualTo(3));
+        timeline.SetClip(2, 0, 99);
+        Assert.That(timeline.Clips[^1], Is.EqualTo(new Clip(1, 0, 3)));
+        Assert.That(timeline.AddSource(2, 99), Is.EqualTo(2));
+        Assert.That(timeline.Clips[^1], Is.EqualTo(new Clip(2, 0, 2)));
+
+        timeline.Undo();
+        timeline.Undo();
+        timeline.Undo();
+        Assert.That(timeline.Clips, Is.EqualTo(new[] { new Clip(0, 0, 5), new Clip(0, 5, 10) }));
+    }
+
+    [Test]
+    public void UndoesAGestureAsOneStep()
+    {
+        var timeline = new Timeline();
+        timeline.Reset(10);
+        Assert.That(timeline.CanUndo, Is.False);
+
+        timeline.BeginGesture();
+        timeline.MoveEdge(0, true, 1);
+        timeline.MoveEdge(0, true, 2);
+        timeline.MoveEdge(0, true, 3);
+        timeline.EndGesture();
+        Assert.That(timeline.Clips, Is.EqualTo(new[] { new Clip(0, 3, 10) }));
+
+        timeline.Undo();
+        Assert.That(timeline.Clips, Is.EqualTo(new[] { new Clip(0, 0, 10) }));
+        Assert.That(timeline.CanUndo, Is.False);
+        timeline.Redo();
+        Assert.That(timeline.Clips, Is.EqualTo(new[] { new Clip(0, 3, 10) }));
+
+        timeline.Undo();
+        timeline.Split(5);
+        Assert.That(timeline.CanRedo, Is.False);
+        timeline.Reset(10);
+        Assert.That(timeline.CanUndo, Is.False);
+    }
+
+    [Test]
+    public void TracksUnexportedCuts()
+    {
+        var timeline = new Timeline();
+        timeline.Reset(10);
+        timeline.Split(5);
+        Assert.That(timeline.Unexported, Is.False);
+        timeline.MoveClip(0, 1);
+        Assert.That(timeline.Unexported, Is.True);
+        timeline.Undo();
+
+        timeline.RemoveClip(1);
+        Assert.That(timeline.Unexported, Is.True);
+        timeline.MarkExported(timeline.Clips.ToList());
+        Assert.That(timeline.Unexported, Is.False);
+        timeline.Undo();
+        timeline.Redo();
+        Assert.That(timeline.Unexported, Is.False);
+    }
+
+    [Test]
+    public void AnswersWhereTimesFall()
+    {
+        var timeline = new Timeline();
+        timeline.Reset(20);
+        timeline.Split(5);
+        timeline.Split(10);
+        timeline.RemoveClip(1);
+        Assert.That(timeline.ClipAt(4.9), Is.EqualTo(0));
+        Assert.That(timeline.ClipAt(5), Is.EqualTo(1));
+        Assert.That(timeline.ClipAt(15), Is.EqualTo(1));
+        Assert.That(timeline.ClipStart(1), Is.EqualTo(5));
+        Assert.That(timeline.EdgeFrom(1, 1), Is.EqualTo(5));
+        Assert.That(timeline.EdgeFrom(5, 1), Is.EqualTo(15));
+        Assert.That(timeline.EdgeFrom(15, 1), Is.EqualTo(15));
+        Assert.That(timeline.EdgeFrom(15, -1), Is.EqualTo(5));
+        Assert.That(timeline.EdgeFrom(0, -1), Is.EqualTo(0));
+        Assert.That(timeline.ClipAt(-1), Is.EqualTo(0));
+    }
+
+    [Test]
+    public void EditsAtATime()
+    {
+        var timeline = new Timeline();
+        timeline.Reset(20);
+        timeline.Split(5);
+        timeline.Split(10);
+        timeline.RemoveAt(7);
+        Assert.That(timeline.Clips, Is.EqualTo(new[] { new Clip(0, 0, 5), new Clip(0, 10, 20) }));
+
+        timeline.TrimTo(2, true);
+        Assert.That(timeline.Clips, Is.EqualTo(new[] { new Clip(0, 2, 5), new Clip(0, 10, 20) }));
+        timeline.TrimTo(12, false);
+        Assert.That(timeline.Clips, Is.EqualTo(new[] { new Clip(0, 2, 5), new Clip(0, 10, 19) }));
+        timeline.Split(4);
+        Assert.That(timeline.Clips, Is.EqualTo(new[] { new Clip(0, 2, 5), new Clip(0, 10, 11), new Clip(0, 11, 19) }));
+
+        timeline.MoveEdge(0, false, -3);
+        Assert.That(timeline.Clips[0], Is.EqualTo(new Clip(0, 2, 2 + Edit.MinimumClip)));
+        timeline.MoveEdge(0, true, 30);
+        Assert.That(timeline.Clips[0], Is.EqualTo(new Clip(0, 2, 2 + Edit.MinimumClip)));
+    }
+
+    [Test]
+    public void NamesTheNextFreeFrame()
+    {
+        string directory = Directory.CreateTempSubdirectory("omacut-frame").FullName;
+        string video = Path.Combine(directory, "clip.mp4");
+        File.WriteAllText(video, "x");
+        Assert.That(FrameExport.NextPath(video), Is.EqualTo(Path.Combine(directory, "clip-frame.png")));
+        File.WriteAllText(Path.Combine(directory, "clip-frame.png"), "x");
+        Assert.That(FrameExport.NextPath(video), Is.EqualTo(Path.Combine(directory, "clip-frame-2.png")));
+        IReadOnlyList<string> args = FrameExport.Arguments(video, 1.25, Path.Combine(directory, "clip-frame.png"));
+        Assert.That(args, Does.Contain("scale=round(iw*sar):ih,setsar=1"));
+        Assert.That(args, Does.Contain("1.249500"));
     }
 }
 
