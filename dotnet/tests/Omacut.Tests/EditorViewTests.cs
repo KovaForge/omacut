@@ -126,4 +126,20 @@ public class EditorViewTests
         Press(window, Key.Z, PhysicalKey.Z, "z");
         Assert.That(editor.Trim.Zoomed, Is.False);
     }
+
+    [AvaloniaTest]
+    public async Task AltRightStepsOnePresentedFrame()
+    {
+        (Window window, EditorView editor) = await OpenAsync();
+        Press(window, Key.Right, PhysicalKey.ArrowRight, null, RawInputModifiers.Alt);
+        for (int i = 0; i < 80 && editor.Trim.Playhead < 0.01; i++)
+        {
+            await Task.Delay(50);
+            Dispatcher.UIThread.RunJobs();
+        }
+
+        // 25 fps test clip: one frame is 0.04s. The old binding jumped 0.2s.
+        Assert.That(editor.Trim.Playhead, Is.GreaterThan(0.01).And.LessThan(0.15));
+        window.Close();
+    }
 }

@@ -22,7 +22,7 @@ Open a video, drag the two handles to pick a start and end, preview the clip, an
 - **Crop on the preview** (`C`): drag a rectangle or its edges and corners. `Enter` applies, `Esc` cancels, `Backspace` resets. The applied crop is what the preview shows.
 - **Formats:** MP4 (H.264/AAC), WebM (VP9/Opus), or GIF (palette-optimized). Encoders are probed, so each ffmpeg build falls back to codecs it actually has.
 - **Audio:** keep or remove it on export. `M` mutes playback.
-- **Frame stepping** with `,` and `.`; `I`/`O` set the trim start and end; `Home`/`End` jump to the trim edges.
+- **Frame stepping** with `,` and `.`. `Alt+Left` / `Alt+Right` pauses and steps one presented frame; holding the key moves 0.2 s. `I`/`O` set the trim start and end; `Home`/`End` jump to the trim edges.
 - **Cancellable export** with a progress bar.
 - **Drag and drop** videos onto the window. The first one opens; more are added to the edit.
 - **Host API:** `OmacutEditor.ShowAsync(options)` returns the exported path. Hosts can also pass ffmpeg paths, an accent color, a PNG watermark to burn in, a default output folder, and close-after-export.
@@ -43,7 +43,7 @@ Anything ffmpeg can read, the editor can play. When no audio device is available
 | Keys | Action |
 |---|---|
 | `Space` | Play / pause |
-| `←` / `→` | Move playhead 1 s (`Shift` 5 s, `Alt` 0.2 s) |
+| `←` / `→` | Move playhead 1 s (`Shift` 5 s). `Alt` steps one frame; hold `Alt` to move 0.2 s |
 | `,` / `.` | Previous / next frame |
 | `Ctrl+Space` or `I` | Trim start to playhead |
 | `Alt+Space` or `O` | Trim end to playhead |

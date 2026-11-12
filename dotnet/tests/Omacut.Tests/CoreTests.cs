@@ -377,6 +377,31 @@ public class TimelineTests
     }
 
     [Test]
+    public void ContinuesAcrossSplitNoiseButNotARealCut()
+    {
+        var left = new Clip(0, 0, 5);
+        Assert.That(Edit.Continues(left, new Clip(0, 5, 8)), Is.True);
+        Assert.That(Edit.Continues(left, new Clip(0, 5.0004, 8)), Is.True);
+        Assert.That(Edit.Continues(left, new Clip(0, 5.04, 8)), Is.False);
+        Assert.That(Edit.Continues(left, new Clip(1, 5, 8)), Is.False);
+
+        var timeline = new Timeline();
+        timeline.Reset(10);
+        timeline.Split(5);
+        Assert.That(timeline.Continues(0), Is.True);
+        Assert.That(timeline.CanJoin(0), Is.True);
+
+        timeline.SetClip(1, 5.0004, 10);
+        Assert.That(timeline.Continues(0), Is.True);
+        Assert.That(timeline.CanJoin(0), Is.False);
+        Assert.That(Edit.Merged(timeline.Clips), Is.EqualTo(new[] { new Clip(0, 0, 10) }));
+
+        timeline.SetClip(1, 5.04, 10);
+        Assert.That(timeline.Continues(0), Is.False);
+        Assert.That(Edit.Merged(timeline.Clips), Has.Count.EqualTo(2));
+    }
+
+    [Test]
     public void AddsAndMovesVideos()
     {
         var timeline = new Timeline();
@@ -567,5 +592,69 @@ public class TrimModelTests
         Assert.That(model.XForTime(5, 14, 200), Is.EqualTo(114));
         Assert.That(model.TimeForX(114, 14, 200), Is.EqualTo(5));
         Assert.That(model.TimeForX(-50, 14, 200), Is.EqualTo(0));
+    }
+}
+
+public class FrameStepTests
+{
+    private static Timeline TimelineOf(double duration)
+    {
+        var timeline = new Timeline();
+        timeline.Reset(duration);
+        return timeline;
+    }
+
+    private static double Step(Timeline timeline, double[] times, double from, int direction)
+    {
+        Assert.That(FrameStep.TryTarget(timeline, times, from, direction, out double to), Is.True);
+        return to;
+    }
+
+    [Test]
+    public void FollowsPresentationTimes()
+    {
+        double[] times = [0, 0.1, 0.4, 0.8];
+        Timeline timeline = TimelineOf(0.9);
+        Assert.That(Step(timeline, times, 0, 1), Is.EqualTo(0.1).Within(1e-9));
+        Assert.That(Step(timeline, times, 0.1, 1), Is.EqualTo(0.4).Within(1e-9));
+        Assert.That(Step(timeline, times, 0.4, -1), Is.EqualTo(0.1).Within(1e-9));
+        Assert.That(Step(timeline, times, 0.6, -1), Is.EqualTo(0.1).Within(1e-9));
+        Assert.That(Step(timeline, times, 0, -1), Is.EqualTo(0).Within(1e-9));
+        Assert.That(Step(timeline, times, timeline.Duration, 1), Is.EqualTo(timeline.Duration).Within(1e-9));
+        Assert.That(Step(timeline, times, timeline.Duration, -1), Is.EqualTo(0.8).Within(1e-9));
+
+        timeline.Split(0.4);
+        Assert.That(Step(timeline, times, 0.4, -1), Is.EqualTo(0.1).Within(1e-9));
+        Assert.That(Step(timeline, times, 0.1, 1), Is.EqualTo(0.4).Within(1e-9));
+
+        timeline.SetClip(1, 0.5, 0.9);
+        Assert.That(Step(timeline, times, 0.4, 1), Is.EqualTo(0.7).Within(1e-9));
+        Assert.That(Step(timeline, times, 0.7, -1), Is.EqualTo(0.4).Within(1e-9));
+
+        timeline.Reset(0.9);
+        timeline.Split(0.4006);
+        Assert.That(Step(timeline, times, 0.401, -1), Is.EqualTo(0.4).Within(1e-9));
+        Assert.That(Step(timeline, times, 0.4, -1), Is.EqualTo(0.1).Within(1e-9));
+
+        timeline.Reset(0.9);
+        timeline.Split(0.4004);
+        Assert.That(Step(timeline, times, 0.4004, -1), Is.EqualTo(0.4).Within(1e-9));
+        Assert.That(Step(timeline, times, 0.4, -1), Is.EqualTo(0.1).Within(1e-9));
+    }
+
+    [Test]
+    public void EmptyTimesDoNotStep()
+    {
+        Assert.That(FrameStep.TryTarget(TimelineOf(1), [], 0, 1, out _), Is.False);
+    }
+}
+
+public class FrameTimeParseTests
+{
+    [Test]
+    public void ParsesSortsDedupesAndSubtractsStart()
+    {
+        double[] times = FrameTimes.Parse("0.200,\n0.100\n0.200\nbogus\n", 0.1);
+        Assert.That(times, Is.EqualTo(new[] { 0.0, 0.1 }));
     }
 }

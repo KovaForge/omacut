@@ -119,6 +119,13 @@ public sealed class Timeline
         _clips[index].Source == _clips[index + 1].Source &&
         _clips[index].Out == _clips[index + 1].In;
 
+    /// <summary>
+    /// The next clip carries on in the same source, including a split's float noise.
+    /// A real cut returns false and playback has to seek.
+    /// </summary>
+    public bool Continues(int index) =>
+        index >= 0 && index + 1 < _clips.Count && Edit.Continues(_clips[index], _clips[index + 1]);
+
     public void Split(double t)
     {
         int i = ClipAt(t);

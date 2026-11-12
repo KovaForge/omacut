@@ -91,6 +91,12 @@ public sealed class EditorView : UserControl, IDisposable
     private int _shownClip;
     private bool _applyingTimeline;
     private bool _savingFrame;
+    private bool _steppingFrame;
+    private int _frameStepSerial;
+    private long _lastAltStepMs;
+    private int _lastAltStepDirection;
+    private double _pausedSequenceTime = -1;
+    private readonly Dictionary<int, double[]> _frameTimes = [];
     private bool _quitAfterExport;
     private bool _exporting;
     private CancellationTokenSource? _exportCancel;
@@ -456,6 +462,7 @@ public sealed class EditorView : UserControl, IDisposable
         Pause();
         _media = media;
         _sources.Clear();
+        _frameTimes.Clear();
         _sources.Add(media);
         _timeline.Reset(media.Duration);
         _sequenceTime = 0;
@@ -676,7 +683,8 @@ public sealed class EditorView : UserControl, IDisposable
             _trim.SetPlayhead(from);
         }
 
-        _engine.Play(from, _trim.End);
+        _pausedSequenceTime = -1;
+        _engine.Play(from, PlaybackEnd());
         _renderTimer.Start();
         UpdateChrome();
     }
@@ -690,9 +698,67 @@ public sealed class EditorView : UserControl, IDisposable
         }
 
         Clip clip = _timeline.Clips[_shownClip];
-        _engine.Play(Math.Clamp(_trim.Playhead, clip.In, clip.Out), clip.Out);
+        _pausedSequenceTime = -1;
+        _engine.Play(Math.Clamp(_trim.Playhead, clip.In, clip.Out), PlaybackEnd());
         _renderTimer.Start();
         UpdateChrome();
+    }
+
+    /// <summary>
+    /// Where this play runs to. A split's float noise plays straight through;
+    /// a real cut stops here so the next clip can be seeked to.
+    /// </summary>
+    private double PlaybackEnd()
+    {
+        if (_timeline.Clips.Count <= 1 || (uint)_shownClip >= (uint)_timeline.Clips.Count)
+        {
+            return _trim.End;
+        }
+
+        int index = _shownClip;
+        double until = _timeline.Clips[index].Out;
+        while (_timeline.Continues(index))
+        {
+            index++;
+            until = _timeline.Clips[index].Out;
+        }
+
+        return until;
+    }
+
+    /// <summary>Points the trim bar at a clip without reloading or seeking the player.</summary>
+    private void AdoptShownClip(int index)
+    {
+        if ((uint)index >= (uint)_timeline.Clips.Count)
+        {
+            return;
+        }
+
+        Clip clip = _timeline.Clips[index];
+        if ((uint)clip.Source >= (uint)_sources.Count)
+        {
+            return;
+        }
+
+        MediaInfo source = _sources[clip.Source];
+        _applyingTimeline = true;
+        try
+        {
+            _shownClip = index;
+            _media = source;
+            if (Math.Abs(_trim.Duration - source.Duration) > 1e-6)
+            {
+                _trim.Reset(source.Duration);
+            }
+
+            // End first: the new in-point can sit past the previous clip's out.
+            _trim.MoveEndTo(clip.Out, parkPlayhead: false);
+            _trim.MoveStartTo(clip.In, parkPlayhead: false);
+        }
+        finally
+        {
+            _applyingTimeline = false;
+        }
     }
 
     private void Pause()
@@ -730,16 +796,48 @@ public sealed class EditorView : UserControl, IDisposable
 
         if (!_trimBar.IsInteracting)
         {
-            _trim.SetPlayhead(_engine.Position);
+            double position = _engine.Position;
+            if (_timeline.Clips.Count > 1)
+            {
+                int index = _shownClip;
+                while (index + 1 < _timeline.Clips.Count
+                       && _timeline.Continues(index)
+                       && position >= _timeline.Clips[index].Out - FrameStep.EdgeTolerance)
+                {
+                    index++;
+                }
+
+                if (index != _shownClip)
+                {
+                    AdoptShownClip(index);
+                }
+            }
+
+            _trim.SetPlayhead(position);
             RememberSequenceTime();
             UpdateStatus();
         }
 
         if (ended)
         {
-            if (_timeline.Clips.Count > 1 && _shownClip + 1 < _timeline.Clips.Count)
+            int next = _shownClip + 1;
+            if (_timeline.Clips.Count > 1 && next < _timeline.Clips.Count)
             {
-                PlaySequenceFrom(_timeline.ClipStart(_shownClip + 1));
+                // A split plays on. A real cut seeks to the next in-point, so the
+                // frames between the two clips never stay on screen.
+                if (_timeline.Continues(_shownClip))
+                {
+                    double from = _engine.Position;
+                    AdoptShownClip(next);
+                    _pausedSequenceTime = -1;
+                    _engine.Play(from, PlaybackEnd());
+                    _renderTimer.Start();
+                }
+                else
+                {
+                    PlaySequenceFrom(_timeline.ClipStart(next));
+                }
+
                 return;
             }
 
@@ -757,10 +855,12 @@ public sealed class EditorView : UserControl, IDisposable
         RememberSequenceTime();
         if (IsPlaying)
         {
-            _engine.Play(_trim.Playhead, _trim.End);
+            _pausedSequenceTime = -1;
+            _engine.Play(_trim.Playhead, PlaybackEnd());
         }
         else
         {
+            _pausedSequenceTime = CurrentSequenceTime();
             RequestFrame(_trim.Playhead);
         }
 
@@ -786,6 +886,156 @@ public sealed class EditorView : UserControl, IDisposable
 
         Pause();
         MovePlayheadTo(_trim.Playhead + direction * _media.FrameDuration);
+    }
+
+    /// <summary>
+    /// A tap of Alt+Left/Right pauses and steps one presented frame. A repeat
+    /// within 100ms in the same direction is a hold, and moves 0.2s instead.
+    /// </summary>
+    private void AltStep(int direction)
+    {
+        if (_media == null || _surface.IsEditingCrop)
+        {
+            return;
+        }
+
+        long now = Environment.TickCount64;
+        bool held = direction == _lastAltStepDirection && now - _lastAltStepMs < 100;
+        _lastAltStepMs = now;
+        _lastAltStepDirection = direction;
+        if (held)
+        {
+            SeekBySequence(0.2 * direction);
+            return;
+        }
+
+        if (IsPlaying)
+        {
+            Pause();
+        }
+
+        _ = StepPresentedFrameAsync(direction);
+    }
+
+    private void SeekBySequence(double delta)
+    {
+        if (_media == null || _timeline.Duration <= 0)
+        {
+            return;
+        }
+
+        double t = Math.Clamp(SequenceTimeForStep() + delta, 0, _timeline.Duration);
+        bool playing = IsPlaying;
+        if (_timeline.Clips.Count <= 1)
+        {
+            double origin = _timeline.Clips.Count == 1 ? _timeline.Clips[0].In : 0;
+            MovePlayheadTo(origin + t);
+            return;
+        }
+
+        ShowClipAt(t, showFrame: !playing);
+        if (playing)
+        {
+            PlaySequenceFrom(t);
+        }
+        else
+        {
+            _pausedSequenceTime = t;
+        }
+    }
+
+    private double SequenceTimeForStep()
+    {
+        double reported = CurrentSequenceTime();
+        if (!IsPlaying && _pausedSequenceTime >= 0
+            && (int)Math.Round(reported * 1000) == (int)Math.Round(_pausedSequenceTime * 1000))
+        {
+            return _pausedSequenceTime;
+        }
+
+        return reported;
+    }
+
+    private async Task StepPresentedFrameAsync(int direction)
+    {
+        if (_steppingFrame || _disposed || _exporting || _savingFrame || _media == null || _timeline.Duration <= 0 || direction == 0)
+        {
+            return;
+        }
+
+        _steppingFrame = true;
+        int serial = ++_frameStepSerial;
+        double from = SequenceTimeForStep();
+        Clip[] clips = _timeline.Clips.ToArray();
+        int index = FrameStep.ClipIndex(_timeline, from, direction);
+        if ((uint)index >= (uint)clips.Length)
+        {
+            _steppingFrame = false;
+            return;
+        }
+
+        int sourceIndex = clips[index].Source;
+        if ((uint)sourceIndex >= (uint)_sources.Count)
+        {
+            _steppingFrame = false;
+            return;
+        }
+
+        MediaInfo source = _sources[sourceIndex];
+        try
+        {
+            if (!_frameTimes.TryGetValue(sourceIndex, out double[]? times))
+            {
+                times = await FrameTimes.ReadAsync(_tools, source.Path, source.Start).ConfigureAwait(true);
+            }
+
+            if (serial != _frameStepSerial || _disposed)
+            {
+                return;
+            }
+
+            if (!clips.SequenceEqual(_timeline.Clips)
+                || (uint)sourceIndex >= (uint)_sources.Count
+                || !string.Equals(_sources[sourceIndex].Path, source.Path, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            if (times == null || times.Length == 0)
+            {
+                ShowNotice("Could not step to the frame: Could not read video frame times.");
+                return;
+            }
+
+            _frameTimes[sourceIndex] = times;
+            if (IsPlaying || Math.Abs(SequenceTimeForStep() - from) > 0.000001)
+            {
+                return;
+            }
+
+            if (!FrameStep.TryTarget(_timeline, times, from, direction, out double to))
+            {
+                ShowNotice("Could not step to the frame: Could not read video frame times.");
+                return;
+            }
+
+            SeekSequence(to);
+            _pausedSequenceTime = to;
+        }
+        catch (Exception ex) when (ex is IOException or InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            if (serial == _frameStepSerial && !_disposed)
+            {
+                ShowNotice("Could not step to the frame: Could not read video frame times.");
+            }
+        }
+        finally
+        {
+            if (serial == _frameStepSerial)
+            {
+                _steppingFrame = false;
+            }
+        }
     }
 
     private void RequestFrame(double time)
@@ -825,6 +1075,8 @@ public sealed class EditorView : UserControl, IDisposable
 
     private void OnScrubbed(double seconds)
     {
+        RememberSequenceTime();
+        _pausedSequenceTime = CurrentSequenceTime();
         RequestFrame(seconds);
         UpdateStatus();
     }
@@ -1627,6 +1879,7 @@ public sealed class EditorView : UserControl, IDisposable
             _trim.MoveEndTo(clip.Out);
             _trim.SetPlayhead(sourceTime);
             _sequenceTime = _timeline.ClipStart(index) + Math.Clamp(sourceTime - clip.In, 0, Math.Max(clip.Length, 0));
+            _pausedSequenceTime = IsPlaying ? -1 : _sequenceTime;
         }
         finally
         {
@@ -1937,11 +2190,17 @@ public sealed class EditorView : UserControl, IDisposable
             case Key.O:
                 MoveTrimEndTo(_trim.Playhead);
                 break;
+            case Key.Left when alt && !shift:
+                AltStep(-1);
+                break;
+            case Key.Right when alt && !shift:
+                AltStep(1);
+                break;
             case Key.Left:
-                SeekBy(shift ? -5 : alt ? -0.2 : -1);
+                SeekBy(shift ? -5 : -1);
                 break;
             case Key.Right:
-                SeekBy(shift ? 5 : alt ? 0.2 : 1);
+                SeekBy(shift ? 5 : 1);
                 break;
             case Key.Home:
                 MovePlayheadTo(_trim.Start);
@@ -2183,7 +2442,7 @@ public sealed class EditorView : UserControl, IDisposable
             ("Space", "Play / pause"),
             ("← / →", "Move playhead 1s"),
             ("Shift ← / →", "Move playhead 5s"),
-            ("Alt ← / →", "Move playhead 0.2s"),
+            ("Alt ← / →", "One frame; hold to move 0.2s"),
             (", / .", "Previous / next frame"),
             ("Ctrl Space  or  I", "Trim start to playhead"),
             ("Alt Space  or  O", "Trim end to playhead"),

@@ -10,7 +10,8 @@ public sealed record MediaInfo(
     int Width,
     int Height,
     double FrameRate,
-    bool HasAudio)
+    bool HasAudio,
+    double Start = 0)
 {
     /// <summary>Length of one frame in seconds (falls back to 30 fps when unknown).</summary>
     public double FrameDuration => 1.0 / (FrameRate > 0 ? FrameRate : 30.0);
@@ -90,11 +91,20 @@ public static class MediaProbe
             (width, height) = (height, width);
         }
 
-        // Duration can live on the stream or on the container.
-        double duration = ParseDouble(GetString(v, "duration"));
-        if (duration <= 0 && root.TryGetProperty("format", out JsonElement format))
+        // Duration can live on the stream or on the container. start_time is the
+        // container's first timestamp; frame times are stored relative to it.
+        double start = 0;
+        double formatDuration = 0;
+        if (root.TryGetProperty("format", out JsonElement format))
         {
-            duration = ParseDouble(GetString(format, "duration"));
+            start = ParseDouble(GetString(format, "start_time"));
+            formatDuration = ParseDouble(GetString(format, "duration"));
+        }
+
+        double duration = ParseDouble(GetString(v, "duration"));
+        if (duration <= 0)
+        {
+            duration = formatDuration;
         }
 
         if (duration <= 0)
@@ -113,7 +123,7 @@ public static class MediaProbe
             frameRate = ParseRate(GetString(v, "r_frame_rate"));
         }
 
-        return new MediaInfo(path, duration, width, height, frameRate is > 0 and <= 1000 ? frameRate : 30.0, hasAudio);
+        return new MediaInfo(path, duration, width, height, frameRate is > 0 and <= 1000 ? frameRate : 30.0, hasAudio, start);
     }
 
     private static bool IsAttachedPicture(JsonElement stream) =>
